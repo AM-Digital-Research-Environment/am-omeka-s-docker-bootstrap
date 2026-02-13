@@ -1,2 +1,2 @@
 # am-omeka-s-docker-bootstrap
-Repo for the building the Omeka S container with required scaffolding 
+Repo for building an Omeka S container with required scaffolding 
