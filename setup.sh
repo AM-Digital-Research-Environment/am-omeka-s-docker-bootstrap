@@ -652,8 +652,13 @@ start_caddy() {
 # ── Configure environment ────────────────────────────────────────────────────
 
 generate_password() {
-    # Generate a 24-character password using /dev/urandom (alphanumeric)
-    tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24
+    # Generate a 24-character password using /dev/urandom (alphanumeric).
+    # Bound the read on the INPUT side: piping an endless /dev/urandom stream
+    # into `head` sends tr SIGPIPE (exit 141) once head closes the pipe, which
+    # `set -euo pipefail` treats as fatal.
+    local pw
+    pw=$(head -c 512 /dev/urandom | tr -dc 'A-Za-z0-9')
+    echo "${pw:0:24}"
 }
 
 configure_env() {
