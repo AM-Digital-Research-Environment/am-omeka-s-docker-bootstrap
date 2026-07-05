@@ -1,0 +1,68 @@
+name: E2E
+
+# Runs the one-click installer end-to-end on a fresh runner: clone the
+# omeka-s-docker template at its latest release, build, launch, and probe the
+# running site. The weekly schedule catches template releases or upstream
+# image changes that would break new installs even when this repo is idle.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays 05:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Shell script syntax
+        run: bash -n setup.sh
+
+      - name: Run one-click installer (non-interactive, HTTP on :8080)
+        env:
+          NONINTERACTIVE: "true"
+          OMEKA_INSTALL_DIR: /opt/omeka-s
+          OMEKA_HTTP_PORT: "8080"
+        run: bash setup.sh
+
+      - name: Show deployed template ref
+        run: git -C /opt/omeka-s describe --tags --always
+
+      - name: Probe the site
+        run: |
+          url="http://127.0.0.1:8080"
+          deadline=$((SECONDS + 300))
+          while :; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$url/" || true)
+            [[ "$code" =~ ^(200|30[123])$ ]] && break
+            if (( SECONDS > deadline )); then
+              echo "Front page never came up (last code: $code)" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "GET / -> $code"
+
+          # Single shot — the admin login location is rate-limited.
+          code=$(curl -s -o /dev/null -w '%{http_code}' -L "$url/admin")
+          echo "GET /admin (followed) -> $code"
+          [[ "$code" == "200" ]]
+
+      - name: Service status and logs on failure
+        if: failure()
+        run: |
+          cd /opt/omeka-s || exit 0
+          docker compose ps || true
+          docker compose logs --tail 200 || true
