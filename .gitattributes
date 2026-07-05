@@ -1,0 +1,4 @@
+# setup.sh runs on Linux servers — keep it LF even on Windows checkouts.
+*.sh text eol=lf
+*.yml text eol=lf
+*.md text eol=lf

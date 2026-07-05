@@ -3,15 +3,36 @@
 # Omeka S Docker — One-Click Setup Script
 # =============================================================================
 # This script bootstraps a fresh Linux server with everything needed to run
-# Omeka S: installs Docker, clones the repository, configures the environment,
-# optionally installs Caddy for automatic HTTPS, and launches the services.
+# Omeka S: installs Docker, clones the repository at its latest release,
+# configures the environment, optionally installs Caddy for automatic HTTPS,
+# and launches the services.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/main/setup.sh | bash
 #   — or —
 #   wget -qO- https://raw.githubusercontent.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/main/setup.sh | bash
 #   — or —
-#   bash setup.sh              (if already cloned)
+#   bash setup.sh [options]    (if already downloaded)
+#
+# Options (each also settable via environment variable):
+#   -y, --yes, --non-interactive   Accept all defaults, never prompt  (NONINTERACTIVE=true)
+#   --dir <path>                   Installation directory             (OMEKA_INSTALL_DIR)
+#   --domain <name>                Domain name — implies HTTPS/Caddy  (OMEKA_DOMAIN)
+#   --port <port>                  HTTP port when not using Caddy     (OMEKA_HTTP_PORT)
+#   --edge                         Deploy the template's main branch
+#                                  instead of the latest release      (BOOTSTRAP_EDGE=true)
+#   --ref <tag|branch|sha>         Deploy an exact template ref       (BOOTSTRAP_REF)
+#   -h, --help                     Show this help
+#
+# Additional environment variables:
+#   MYSQL_PASSWORD          MySQL password (default: auto-generated)
+#   OMEKA_ADMIN_EMAIL       Admin account email (default: admin@example.com)
+#   OMEKA_ADMIN_PASSWORD    Admin account password (default: auto-generated)
+#   OMEKA_TITLE             Site title (default: "Omeka S")
+#
+# Prompts read from /dev/tty, so interactive use works with `curl | bash`.
+# Without a TTY (CI, cron), the script automatically switches to
+# non-interactive mode and accepts all defaults.
 #
 # Supports: Ubuntu, Debian, Fedora, Rocky/Alma Linux
 # =============================================================================
@@ -28,24 +49,45 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m' # No Colour
 
-log_step()  { echo -e "\n${BLUE}▸${NC} ${BOLD}$*${NC}"; }
-log_ok()    { echo -e "  ${GREEN}✔${NC} $*"; }
-log_warn()  { echo -e "  ${YELLOW}⚠${NC} $*"; }
-log_error() { echo -e "  ${RED}✖${NC} $*" >&2; }
-log_info()  { echo -e "  ${CYAN}ℹ${NC} $*"; }
+# All logging goes to stderr: several helpers below are called inside
+# command substitution, where anything written to stdout would be captured
+# into the variable instead of shown to the user.
+log_step()  { echo >&2 -e "\n${BLUE}▸${NC} ${BOLD}$*${NC}"; }
+log_ok()    { echo >&2 -e "  ${GREEN}✔${NC} $*"; }
+log_warn()  { echo >&2 -e "  ${YELLOW}⚠${NC} $*"; }
+log_error() { echo >&2 -e "  ${RED}✖${NC} $*"; }
+log_info()  { echo >&2 -e "  ${CYAN}ℹ${NC} $*"; }
+
+# Interactivity: prompts must read from /dev/tty because with `curl | bash`
+# stdin is the script itself — a plain `read` would eat script lines.
+NONINTERACTIVE="${NONINTERACTIVE:-false}"
+if [[ "${NONINTERACTIVE}" != "true" ]] && { [[ ! -r /dev/tty ]] || [[ ! -w /dev/tty ]]; }; then
+    NONINTERACTIVE=true
+    log_warn "No TTY available — running non-interactively with defaults."
+fi
 
 ask() {
-    local prompt="$1" default="$2" reply
-    echo -en "  ${CYAN}?${NC} ${prompt} [${default}]: "
-    read -r reply
+    local prompt="$1" default="$2" reply=""
+    if [[ "${NONINTERACTIVE}" == "true" ]]; then
+        log_info "${prompt}: ${default} (default)"
+        echo "${default}"
+        return
+    fi
+    echo >&2 -en "  ${CYAN}?${NC} ${prompt} [${default}]: "
+    read -r reply < /dev/tty || reply=""
     echo "${reply:-$default}"
 }
 
 ask_yes_no() {
-    local prompt="$1" default="${2:-y}" reply
-    echo -en "  ${CYAN}?${NC} ${prompt} [${default}]: "
-    read -r reply
-    reply="${reply:-$default}"
+    local prompt="$1" default="${2:-y}" reply=""
+    if [[ "${NONINTERACTIVE}" == "true" ]]; then
+        reply="$default"
+        log_info "${prompt} ${reply} (default)"
+    else
+        echo >&2 -en "  ${CYAN}?${NC} ${prompt} [${default}]: "
+        read -r reply < /dev/tty || reply=""
+        reply="${reply:-$default}"
+    fi
     [[ "${reply,,}" == "y" || "${reply,,}" == "yes" ]]
 }
 
@@ -62,10 +104,14 @@ BANNER
     echo -e "  and launch a production-ready Omeka S instance.\n"
 }
 
+usage() {
+    sed -n '2,40p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || true
+}
+
 # ── Global state ─────────────────────────────────────────────────────────────
 
 ENABLE_CADDY=false
-DOMAIN_NAME=""
+DOMAIN_NAME="${OMEKA_DOMAIN:-}"
 PROJECT_DIR=""
 COMPOSE_CMD="docker compose"
 DOCKER_CMD="docker"
@@ -73,6 +119,34 @@ SUDO=""
 DISTRO_ID=""
 DISTRO_NAME=""
 DISTRO_FAMILY=""
+EDGE="${BOOTSTRAP_EDGE:-false}"
+BOOTSTRAP_REF="${BOOTSTRAP_REF:-}"
+DEPLOYED_REF=""
+ADMIN_EMAIL=""
+ADMIN_PASSWORD=""
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes|--non-interactive) NONINTERACTIVE=true ;;
+            --edge)      EDGE=true ;;
+            --ref)       BOOTSTRAP_REF="${2:?--ref needs a value}"; shift ;;
+            --ref=*)     BOOTSTRAP_REF="${1#*=}" ;;
+            --dir)       OMEKA_INSTALL_DIR="${2:?--dir needs a value}"; shift ;;
+            --dir=*)     OMEKA_INSTALL_DIR="${1#*=}" ;;
+            --domain)    OMEKA_DOMAIN="${2:?--domain needs a value}"; DOMAIN_NAME="${OMEKA_DOMAIN}"; shift ;;
+            --domain=*)  OMEKA_DOMAIN="${1#*=}"; DOMAIN_NAME="${OMEKA_DOMAIN}" ;;
+            --port)      OMEKA_HTTP_PORT="${2:?--port needs a value}"; shift ;;
+            --port=*)    OMEKA_HTTP_PORT="${1#*=}" ;;
+            -h|--help)   usage; exit 0 ;;
+            *)
+                log_error "Unknown option: $1 (see --help)"
+                exit 1
+                ;;
+        esac
+        shift
+    done
+}
 
 # ── Pre-flight checks ───────────────────────────────────────────────────────
 
@@ -283,6 +357,37 @@ install_git() {
 
 REPO_URL="https://github.com/AM-Digital-Research-Environment/omeka-s-docker.git"
 
+checkout_release() {
+    # Pin the deployment to a known-good template state. By default: the
+    # latest release tag (tested by the template's CI). --edge stays on main;
+    # --ref deploys an exact tag/branch/commit.
+    if [[ -n "${BOOTSTRAP_REF}" ]]; then
+        log_info "Checking out requested ref '${BOOTSTRAP_REF}'..."
+        git -C "${PROJECT_DIR}" checkout -q "${BOOTSTRAP_REF}"
+        DEPLOYED_REF="${BOOTSTRAP_REF}"
+        log_ok "Deployed template at ${BOOTSTRAP_REF}"
+        return
+    fi
+
+    if [[ "${EDGE}" == "true" ]]; then
+        DEPLOYED_REF="main (edge)"
+        log_ok "Deploying template main branch (--edge)"
+        return
+    fi
+
+    local latest_tag
+    latest_tag=$(git -C "${PROJECT_DIR}" tag --list 'v*' --sort=-version:refname | head -n1)
+    if [[ -n "${latest_tag}" ]]; then
+        git -C "${PROJECT_DIR}" checkout -q "${latest_tag}"
+        DEPLOYED_REF="${latest_tag}"
+        log_ok "Deployed template at latest release: ${latest_tag}"
+        log_info "To update later: cd into the directory, 'git fetch --tags' and checkout the new tag."
+    else
+        DEPLOYED_REF="main (no releases found)"
+        log_warn "No release tags found — using the main branch."
+    fi
+}
+
 clone_repo() {
     log_step "Setting up Omeka S Docker"
 
@@ -293,7 +398,7 @@ clone_repo() {
         return
     fi
 
-    local default_dir="/opt/omeka-s"
+    local default_dir="${OMEKA_INSTALL_DIR:-/opt/omeka-s}"
     local install_dir
     install_dir=$(ask "Installation directory" "${default_dir}")
 
@@ -323,12 +428,28 @@ clone_repo() {
 
     PROJECT_DIR="${install_dir}"
     log_ok "Cloned to ${PROJECT_DIR}"
+
+    checkout_release
 }
 
 # ── HTTPS / Caddy ────────────────────────────────────────────────────────────
 
 ask_https() {
     log_step "HTTPS Configuration"
+
+    # A domain passed via --domain / OMEKA_DOMAIN implies HTTPS.
+    if [[ -n "${DOMAIN_NAME}" ]]; then
+        ENABLE_CADDY=true
+        log_ok "HTTPS will be enabled for ${DOMAIN_NAME} (domain provided)"
+        log_info "Make sure ${DOMAIN_NAME} has a DNS A record pointing to this server."
+        return
+    fi
+
+    if [[ "${NONINTERACTIVE}" == "true" ]]; then
+        ENABLE_CADDY=false
+        log_ok "Non-interactive: HTTP only (pass --domain or set OMEKA_DOMAIN for HTTPS)"
+        return
+    fi
 
     echo ""
     echo -e "  Caddy can provide ${BOLD}automatic HTTPS${NC} with Let's Encrypt certificates."
@@ -553,54 +674,77 @@ configure_env() {
     echo ""
 
     # MySQL password
-    local auto_password
-    auto_password=$(generate_password)
-    echo -e "  ${CYAN}?${NC} MySQL password"
-    echo -e "    Press ${BOLD}Enter${NC} to use an auto-generated secure password,"
-    echo -e "    or type your own."
     local mysql_password
-    mysql_password=$(ask "Password" "${auto_password}")
-
-    # Nginx port — depends on whether Caddy is enabled
-    local nginx_port
-    if $ENABLE_CADDY; then
-        # Bind nginx to localhost only — Caddy handles external traffic
-        nginx_port="127.0.0.1:8080"
-        log_info "Nginx will listen on 127.0.0.1:8080 (Caddy handles ports 80/443)"
+    if [[ -n "${MYSQL_PASSWORD:-}" ]]; then
+        mysql_password="${MYSQL_PASSWORD}"
+        log_ok "Using MySQL password from environment"
     else
-        nginx_port=$(ask "HTTP port for Omeka S" "80")
+        local auto_password
+        auto_password=$(generate_password)
+        log_info "MySQL password — press Enter for an auto-generated secure password, or type your own."
+        mysql_password=$(ask "MySQL password" "${auto_password}")
     fi
 
-    # Omeka S version
-    local omeka_version
-    omeka_version=$(ask "Omeka S version" "4.2.0")
+    # Admin account: creating it here skips Omeka's web install wizard AND
+    # avoids the default admin@example.com/admin credentials the installer
+    # would otherwise create.
+    ADMIN_EMAIL=$(ask "Admin account email" "${OMEKA_ADMIN_EMAIL:-admin@example.com}")
+    if [[ -n "${OMEKA_ADMIN_PASSWORD:-}" ]]; then
+        ADMIN_PASSWORD="${OMEKA_ADMIN_PASSWORD}"
+        log_ok "Using admin password from environment"
+    else
+        ADMIN_PASSWORD=$(generate_password)
+        log_info "Admin password auto-generated (shown in the summary at the end)."
+    fi
+
+    # Site title
+    local site_title
+    site_title=$(ask "Site title" "${OMEKA_TITLE:-Omeka S}")
+
+    # Bind address + port. With Caddy, nginx binds to localhost only and Caddy
+    # handles 80/443; without it, nginx must bind 0.0.0.0 to be reachable.
+    local nginx_bind nginx_port
+    if $ENABLE_CADDY; then
+        nginx_bind="127.0.0.1"
+        nginx_port="8080"
+        log_info "Nginx will listen on 127.0.0.1:8080 (Caddy handles ports 80/443)"
+    else
+        nginx_bind="0.0.0.0"
+        nginx_port=$(ask "HTTP port for Omeka S" "${OMEKA_HTTP_PORT:-80}")
+    fi
 
     # Write .env
     cat > "${env_file}" << EOF
 # Omeka S Docker — Generated by setup.sh on $(date -Iseconds)
+# Template ref: ${DEPLOYED_REF:-unknown}
 
 # MySQL password
-MYSQL_PASSWORD=${mysql_password}
+MYSQL_PASSWORD="${mysql_password}"
 
-# Omeka S version
-OMEKA_VERSION=${omeka_version}
+# Admin account (created automatically on first run; log in and change
+# the password afterwards if this file was ever exposed)
+OMEKA_ADMIN_EMAIL="${ADMIN_EMAIL}"
+OMEKA_ADMIN_USERNAME="admin"
+OMEKA_ADMIN_PASSWORD="${ADMIN_PASSWORD}"
+OMEKA_TITLE="${site_title}"
 
-# Nginx port
-# When Caddy is enabled, nginx binds to localhost only (Caddy → 127.0.0.1:8080)
-# When Caddy is disabled, nginx binds directly to the specified port
+# Where nginx listens on the host.
+# With Caddy: localhost only (Caddy proxies 80/443 -> 127.0.0.1:8080).
+# Without Caddy: 0.0.0.0 so the site is reachable from outside.
+NGINX_BIND=${nginx_bind}
 NGINX_PORT=${nginx_port}
 EOF
 
+    if $ENABLE_CADDY; then
+        cat >> "${env_file}" << EOF
+
+# Public hostname (used in nginx server_name)
+SERVER_NAME=${DOMAIN_NAME}
+EOF
+    fi
+
     chmod 600 "${env_file}"
     log_ok "Configuration saved to .env"
-
-    if [[ "${mysql_password}" == "${auto_password}" ]]; then
-        log_info "Auto-generated MySQL password (saved in .env):"
-        echo -e "    ${BOLD}${mysql_password}${NC}"
-        echo ""
-        log_warn "Store this password somewhere safe. You'll rarely need it,"
-        log_warn "but it's required if you ever connect to the database directly."
-    fi
 }
 
 # ── Firewall ─────────────────────────────────────────────────────────────────
@@ -612,9 +756,7 @@ configure_firewall() {
         ports=(80 443)
     else
         local port
-        port=$(grep -oP 'NGINX_PORT=\K.*' "${PROJECT_DIR}/.env" 2>/dev/null || echo "80")
-        # Strip any IP binding prefix (e.g. "127.0.0.1:8080" → "8080")
-        port="${port##*:}"
+        port=$(grep -oP '^NGINX_PORT=\K.*' "${PROJECT_DIR}/.env" 2>/dev/null || echo "80")
         ports=("${port}")
     fi
 
@@ -656,9 +798,10 @@ launch() {
     log_info "Starting services..."
     $COMPOSE_CMD up -d
 
-    # Wait for healthy state
+    # Wait for healthy state. First boot includes the Omeka S installation
+    # (database migrations, module setup), which takes a few minutes.
     log_info "Waiting for services to become healthy..."
-    local max_wait=180
+    local max_wait=360
     local waited=0
     local all_healthy=false
 
@@ -711,9 +854,7 @@ print_summary() {
         url="https://${DOMAIN_NAME}"
     else
         local port
-        port=$(grep -oP 'NGINX_PORT=\K.*' "${PROJECT_DIR}/.env" 2>/dev/null || echo "80")
-        # Strip any IP binding prefix
-        port="${port##*:}"
+        port=$(grep -oP '^NGINX_PORT=\K.*' "${PROJECT_DIR}/.env" 2>/dev/null || echo "80")
         url="http://${ip}"
         if [[ "${port}" != "80" ]]; then
             url="http://${ip}:${port}"
@@ -729,7 +870,18 @@ print_summary() {
 DONE
     echo -e "${NC}"
     echo -e "  ${BOLD}Access Omeka S at:${NC}  ${CYAN}${url}${NC}"
+    if [[ -n "${DEPLOYED_REF}" ]]; then
+        echo -e "  ${BOLD}Template version:${NC}   ${DEPLOYED_REF}"
+    fi
     echo ""
+
+    if [[ -n "${ADMIN_PASSWORD}" ]]; then
+        echo -e "  ${BOLD}Admin login${NC} (also saved in ${PROJECT_DIR}/.env):"
+        echo -e "    Email:    ${BOLD}${ADMIN_EMAIL}${NC}"
+        echo -e "    Password: ${BOLD}${ADMIN_PASSWORD}${NC}"
+        echo -e "    Log in at ${CYAN}${url}/admin${NC} and store these credentials safely."
+        echo ""
+    fi
 
     if $ENABLE_CADDY; then
         echo -e "  ${BOLD}HTTPS:${NC}  Managed by Caddy (auto Let's Encrypt)"
@@ -757,15 +909,15 @@ DONE
     echo -e "    bash scripts/install-module.sh CSVImport  ${CYAN}# Install a module${NC}"
     echo ""
     echo -e "  ${BOLD}First-time setup:${NC}"
-    echo -e "    Omeka S auto-installs on first start. This can take 5-10 minutes."
+    echo -e "    Omeka S auto-installs on first start. This can take a few minutes."
     echo -e "    Watch progress with: ${COMPOSE_CMD} logs -f php"
-    echo -e "    Once ready, visit ${CYAN}${url}${NC} to create your admin account."
     echo ""
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
+    parse_args "$@"
     banner
     preflight
     install_docker
