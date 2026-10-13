@@ -172,11 +172,17 @@ preflight() {
     fi
     log_ok "Detected: ${DISTRO_NAME}"
 
-    # Check available RAM (warn if < 2 GB)
+    # Check available RAM. The template recommends ~4 GB: its default
+    # per-service memory ceilings add up to about 3.5 GiB. MemTotal sits a
+    # little below a VM's nominal size (the kernel reserves some), so the
+    # thresholds leave headroom: a "4 GB" server passes, a "2 GB" one warns.
     local total_ram_mb
     total_ram_mb=$(awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo)
-    if (( total_ram_mb < 2048 )); then
-        log_warn "Only ${total_ram_mb} MB RAM detected. Recommended: 2048 MB or more."
+    if (( total_ram_mb < 1800 )); then
+        log_error "Only ${total_ram_mb} MB RAM detected — well below the recommended 4 GB."
+        log_warn "The install may succeed, but expect out-of-memory errors under load or during upgrades."
+    elif (( total_ram_mb < 3500 )); then
+        log_warn "Only ${total_ram_mb} MB RAM detected. Recommended: 4 GB or more (out-of-memory errors are likely under load or during upgrades)."
     else
         log_ok "RAM: ${total_ram_mb} MB"
     fi
@@ -381,7 +387,7 @@ checkout_release() {
         git -C "${PROJECT_DIR}" checkout -q "${latest_tag}"
         DEPLOYED_REF="${latest_tag}"
         log_ok "Deployed template at latest release: ${latest_tag}"
-        log_info "To update later: cd into the directory, 'git fetch --tags' and checkout the new tag."
+        log_info "To move to a newer template release later: 'bash scripts/backup.sh', then 'git fetch --tags' and checkout the new tag (see the summary at the end)."
     else
         DEPLOYED_REF="main (no releases found)"
         log_warn "No release tags found — using the main branch."
@@ -746,6 +752,19 @@ EOF
 # Public hostname (used in nginx server_name)
 SERVER_NAME=${DOMAIN_NAME}
 EOF
+    else
+        # With no proxy in front, nginx must not believe client-supplied
+        # X-Forwarded-For / X-Forwarded-Proto: that would let a client dodge the
+        # admin-login rate limit and pose as HTTPS. (The Caddy branch keeps the
+        # default range, which covers the Docker gateway Caddy arrives through.)
+        cat >> "${env_file}" << 'EOF'
+
+# Direct HTTP, no reverse proxy: trust no peer's forwarded headers.
+# 192.0.2.1 is a documentation-only address, not a proxy to configure.
+# If you later put a reverse proxy in front, set this to its address as seen
+# by the web container (see the template's docs/PRODUCTION.md).
+NGINX_TRUSTED_PROXY_CIDR=192.0.2.1/32
+EOF
     fi
 
     chmod 600 "${env_file}"
@@ -916,6 +935,15 @@ DONE
     echo -e "  ${BOLD}First-time setup:${NC}"
     echo -e "    Omeka S auto-installs on first start. This can take a few minutes."
     echo -e "    Watch progress with: ${COMPOSE_CMD} logs -f php"
+    echo ""
+    echo -e "  ${BOLD}Keeping it up to date${NC} (run from ${PROJECT_DIR}):"
+    echo -e "    bash scripts/update-omeka.sh --dry-run  ${CYAN}# New Omeka S version (backs up first)${NC}"
+    # Newer than the v2.2.0 release; only mention it when this checkout has it.
+    if [[ -f "${PROJECT_DIR}/scripts/update-extensions.sh" ]]; then
+        echo -e "    bash scripts/update-extensions.sh       ${CYAN}# Modules and themes, in place${NC}"
+    fi
+    echo -e "    bash scripts/backup.sh                 ${CYAN}# Always before moving to a new template tag${NC}"
+    echo -e "    Details: ${CYAN}https://github.com/AM-Digital-Research-Environment/omeka-s-docker#keeping-it-up-to-date${NC}"
     echo ""
 }
 

@@ -62,16 +62,28 @@ curl -fsSL https://raw.githubusercontent.com/AM-Digital-Research-Environment/am-
 
 ## Releases, not moving targets
 
-The installer checks out the template's **latest release tag** (`v*`), so new installs always get a state that has passed the template's CI — development on the template's `main` branch can never break a one-click install. To update an existing installation later:
+The installer checks out the template's **latest release tag** (`v*`), so new installs always get a state that has passed the template's CI — development on the template's `main` branch can never break a one-click install. Use `--edge` if you deliberately want the newest unreleased state.
+
+### Keeping an installation up to date
+
+Day-to-day updates use the template's own scripts, run from the installation directory (see the template's [Keeping it up to date](https://github.com/AM-Digital-Research-Environment/omeka-s-docker#keeping-it-up-to-date) for details):
 
 ```bash
 cd /opt/omeka-s
+bash scripts/update-omeka.sh --dry-run   # see which Omeka S version it would move to
+bash scripts/update-omeka.sh             # backs up, rebuilds, restores the old .env if the build fails
+bash scripts/update-extensions.sh        # modules and themes, in place (template releases after v2.2.0)
+```
+
+To move to a newer **template release**, back up first:
+
+```bash
+cd /opt/omeka-s
+bash scripts/backup.sh
 git fetch --tags
 git checkout <new-tag>
 docker compose up -d --build
 ```
-
-Use `--edge` if you deliberately want the newest unreleased state.
 
 ## HTTPS with Caddy
 
@@ -88,7 +100,7 @@ When you choose automatic HTTPS during setup (or pass `--domain`), the script:
 Internet (HTTPS:443) → Caddy (host) → nginx (127.0.0.1:8080) → PHP-FPM → MySQL
 ```
 
-Without Caddy, nginx binds `0.0.0.0` on the chosen port so the site is directly reachable.
+Without Caddy, nginx binds `0.0.0.0` on the chosen port so the site is directly reachable, and the script sets `NGINX_TRUSTED_PROXY_CIDR=192.0.2.1/32` so nginx ignores client-supplied `X-Forwarded-For` / `X-Forwarded-Proto` headers (otherwise a client could dodge the admin-login rate limit or pose as HTTPS). The template honours this setting from the release after `v2.2.0` (and on `--edge`); `v2.2.0` itself ignores it and trusts forwarded headers from any private address. Direct HTTP is meant for test installs; put TLS in front of a public site.
 
 ## Supported Distributions
 
@@ -105,7 +117,7 @@ Other distributions will attempt Docker's convenience install script as a fallba
 - A Linux server (see supported distributions above)
 - Root or sudo access
 - For HTTPS: a domain name pointing to the server
-- Recommended: 2 GB+ RAM, 10 GB+ free disk space
+- Recommended: 4 GB+ RAM, 10 GB+ free disk space. The template's default per-service memory limits add up to about 3.5 GiB; a 2 GB server installs but can run out of memory under load or during a module upgrade, and the script warns below that.
 
 ## Continuous testing
 
