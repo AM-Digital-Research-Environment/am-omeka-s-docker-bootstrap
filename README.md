@@ -123,6 +123,10 @@ Other distributions will attempt Docker's convenience install script as a fallba
 
 A [weekly workflow](.github/workflows/e2e.yml) runs the installer end-to-end on a fresh runner against the latest template release and probes the resulting site, so breakage in the template↔installer contract surfaces here instead of on someone's new server.
 
+## Security
+
+Please report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
+
 ## Related
 
 - **[omeka-s-docker](https://github.com/AM-Digital-Research-Environment/omeka-s-docker)** — the Docker template this script deploys (manual setup instructions, module management, configuration reference, deployment overlays)
