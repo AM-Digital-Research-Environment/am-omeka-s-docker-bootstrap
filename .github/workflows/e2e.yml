@@ -40,6 +40,9 @@ jobs:
       - name: Show deployed template ref
         run: git -C /opt/omeka-s describe --tags --always
 
+      - name: HTTP-only install trusts no forwarded headers
+        run: sudo grep -qx 'NGINX_TRUSTED_PROXY_CIDR=192.0.2.1/32' /opt/omeka-s/.env
+
       - name: Probe the site
         run: |
           url="http://127.0.0.1:8080"
