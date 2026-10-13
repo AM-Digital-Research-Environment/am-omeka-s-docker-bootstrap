@@ -938,7 +938,7 @@ DONE
     echo ""
     echo -e "  ${BOLD}Keeping it up to date${NC} (run from ${PROJECT_DIR}):"
     echo -e "    bash scripts/update-omeka.sh --dry-run  ${CYAN}# New Omeka S version (backs up first)${NC}"
-    # Newer than the v2.2.0 release; only mention it when this checkout has it.
+    # Added in template v2.3.0; an older --ref checkout doesn't have it.
     if [[ -f "${PROJECT_DIR}/scripts/update-extensions.sh" ]]; then
         echo -e "    bash scripts/update-extensions.sh       ${CYAN}# Modules and themes, in place${NC}"
     fi
