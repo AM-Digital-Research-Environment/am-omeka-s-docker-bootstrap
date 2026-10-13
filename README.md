@@ -20,6 +20,16 @@ wget -qO- https://raw.githubusercontent.com/AM-Digital-Research-Environment/am-o
 
 Prompts read from your terminal, so the `curl | bash` form stays interactive. At the end, the script prints the URL of your new site and the generated admin credentials.
 
+### Installing a fixed version
+
+The commands above always run the newest installer from `main`. For repeatable automation, pin a [release](https://github.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/releases) of the installer by replacing `main` in the URL with its tag:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/v1.0.0/setup.sh | bash
+```
+
+This pins the installer only. It still deploys the template's latest release unless you also pass `--ref <tag>` (see [Options](#options)).
+
 ## What the Script Does
 
 1. **Pre-flight checks** — verifies Linux, detects distro, checks RAM and disk space
@@ -72,7 +82,7 @@ Day-to-day updates use the template's own scripts, run from the installation dir
 cd /opt/omeka-s
 bash scripts/update-omeka.sh --dry-run   # see which Omeka S version it would move to
 bash scripts/update-omeka.sh             # backs up, rebuilds, restores the old .env if the build fails
-bash scripts/update-extensions.sh        # modules and themes, in place (template releases after v2.2.0)
+bash scripts/update-extensions.sh        # modules and themes, in place (template v2.3.0 and later)
 ```
 
 To move to a newer **template release**, back up first:
@@ -100,7 +110,7 @@ When you choose automatic HTTPS during setup (or pass `--domain`), the script:
 Internet (HTTPS:443) → Caddy (host) → nginx (127.0.0.1:8080) → PHP-FPM → MySQL
 ```
 
-Without Caddy, nginx binds `0.0.0.0` on the chosen port so the site is directly reachable, and the script sets `NGINX_TRUSTED_PROXY_CIDR=192.0.2.1/32` so nginx ignores client-supplied `X-Forwarded-For` / `X-Forwarded-Proto` headers (otherwise a client could dodge the admin-login rate limit or pose as HTTPS). The template honours this setting from the release after `v2.2.0` (and on `--edge`); `v2.2.0` itself ignores it and trusts forwarded headers from any private address. Direct HTTP is meant for test installs; put TLS in front of a public site.
+Without Caddy, nginx binds `0.0.0.0` on the chosen port so the site is directly reachable, and the script sets `NGINX_TRUSTED_PROXY_CIDR=192.0.2.1/32` so nginx ignores client-supplied `X-Forwarded-For` / `X-Forwarded-Proto` headers (otherwise a client could dodge the admin-login rate limit or pose as HTTPS). The template honours this setting from `v2.3.0`; older releases ignore it and trust forwarded headers from any private address. Direct HTTP is meant for test installs; put TLS in front of a public site.
 
 ## Supported Distributions
 
