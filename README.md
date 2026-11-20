@@ -2,136 +2,162 @@
 
 [![E2E](https://github.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/actions/workflows/e2e.yml/badge.svg)](https://github.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/actions/workflows/e2e.yml)
 
-One-click setup script for deploying [Omeka S](https://omeka.org/s/) on a fresh Linux server. This script automates the entire process: installing Docker, cloning the [omeka-s-docker](https://github.com/AM-Digital-Research-Environment/omeka-s-docker) template **at its latest tested release**, configuring the environment (including the admin account), and launching the services.
+A one-command installer for [Omeka S](https://omeka.org/s/) on a fresh Linux server. It installs Docker, deploys the [omeka-s-docker](https://github.com/AM-Digital-Research-Environment/omeka-s-docker) template at its **latest tested release**, writes the configuration (admin account included, automatic HTTPS if you want it), starts the site and waits until it is ready.
 
-## Quick Start
+## Quick start
 
-Run this single command on a clean Linux VM (Ubuntu, Debian, Fedora, Rocky, Alma):
+Run this on a clean Linux server (Ubuntu, Debian, Fedora, Rocky, Alma):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/main/setup.sh | bash
 ```
 
-Or with `wget`:
+`wget -qO- <same URL> | bash` works too. The script asks its questions in your terminal, even through the pipe. To pass options through the pipe, put them after `bash -s --`:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/main/setup.sh | bash
+curl -fsSL https://raw.githubusercontent.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/main/setup.sh | bash -s -- --domain omeka.example.edu
 ```
 
-Prompts read from your terminal, so the `curl | bash` form stays interactive. At the end, the script prints the URL of your new site and the generated admin credentials.
+At the end it prints the site's address and the admin login. **The admin password is shown only this once**: store it straight away, for example in a password manager.
 
 ### Installing a fixed version
 
-The commands above always run the newest installer from `main`. For repeatable automation, pin a [release](https://github.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/releases) of the installer by replacing `main` in the URL with its tag:
+The commands above run the newest installer from `main`. For repeatable automation, replace `main` in the URL with a [release](https://github.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/releases) tag. This pins the installer only; it still deploys the template's latest release unless you also pass `--ref <tag>`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/v1.0.0/setup.sh | bash
 ```
 
-This pins the installer only. It still deploys the template's latest release unless you also pass `--ref <tag>` (see [Options](#options)).
+## What the script does
 
-## What the Script Does
+1. **Checks the server**: Linux distribution, memory (warns below about 4 GB) and free disk (warns below 10 GB).
+2. **Installs Docker and Git** if missing, from Docker's official repository.
+3. **Downloads the template** to `/opt/omeka-s` at its latest release tag.
+4. **Asks** whether you want HTTPS, the admin e-mail address, the site title and, without HTTPS, the HTTP port. It generates the admin password, the MySQL password and an encryption key.
+5. **Checks** that the ports are free and, with HTTPS, that the domain points to this server.
+6. **Writes `.env`**, the configuration file, readable only by its owner, and offers to open the ports if the ufw or firewalld firewall is active.
+7. **Builds and starts** the site and waits until every service is healthy (up to 10 minutes; the first start installs Omeka).
+8. **Removes the admin login from `.env`** once the account exists, and prints the summary.
 
-1. **Pre-flight checks** — verifies Linux, detects distro, checks RAM and disk space
-2. **Installs Docker and Git** (if not already present)
-3. **Clones** the [omeka-s-docker](https://github.com/AM-Digital-Research-Environment/omeka-s-docker) template and checks out its **latest release tag** (use `--edge` for the `main` branch, or `--ref <tag>` for a specific version)
-4. **Asks if you want automatic HTTPS** — installs [Caddy](https://caddyserver.com/) with Let's Encrypt
-5. **Configures** MySQL password, the Omeka S admin account, site title, and HTTP port
-6. **Opens firewall ports** (if ufw or firewalld is active)
-7. **Builds and launches** the Docker stack
-8. **Waits for healthy services** and prints a summary with the access URL and admin login
+`.env` holds `OMEKA_SECRET_KEY`, which Omeka uses to encrypt stored secrets such as module API keys. **Never change it**; back it up with `.env` (the template's `scripts/backup.sh` does).
 
 ## Options
 
-Every option can be passed as a flag or as an environment variable, so the script works both interactively and in automation:
-
 | Flag | Environment variable | Default | Purpose |
 |------|---------------------|---------|---------|
-| `-y`, `--yes`, `--non-interactive` | `NONINTERACTIVE=true` | off (auto-on without a TTY) | Accept all defaults, never prompt |
+| `-y`, `--yes`, `--non-interactive` | `NONINTERACTIVE=true` | off (on without a terminal) | Accept all defaults, never ask |
 | `--dir <path>` | `OMEKA_INSTALL_DIR` | `/opt/omeka-s` | Installation directory |
-| `--domain <name>` | `OMEKA_DOMAIN` | — | Domain name; providing one implies HTTPS with Caddy |
-| `--port <port>` | `OMEKA_HTTP_PORT` | `80` | HTTP port (only without Caddy) |
-| `--edge` | `BOOTSTRAP_EDGE=true` | off | Deploy the template's `main` branch instead of the latest release |
-| `--ref <ref>` | `BOOTSTRAP_REF` | — | Deploy an exact template tag/branch/commit |
-| — | `MYSQL_PASSWORD` | auto-generated | MySQL password |
-| — | `OMEKA_ADMIN_EMAIL` | `admin@example.com` | Admin account email |
-| — | `OMEKA_ADMIN_PASSWORD` | auto-generated | Admin account password |
-| — | `OMEKA_TITLE` | `Omeka S` | Site title |
+| `--domain <name>` | `OMEKA_DOMAIN` | none | Domain name; turns on HTTPS |
+| `--port <port>` | `OMEKA_HTTP_PORT` | `80` | HTTP port (without HTTPS) |
+| `--edge` | `BOOTSTRAP_EDGE=true` | off | Deploy the template's `main` branch, not the latest release |
+| `--ref <ref>` | `BOOTSTRAP_REF` | none | Deploy an exact template tag, branch or commit |
+| `-h`, `--help` | | | Show the help |
+| | `OMEKA_ADMIN_EMAIL` | asked (`admin@example.com` without prompts) | Admin e-mail |
+| | `OMEKA_ADMIN_PASSWORD` | generated | Admin password |
+| | `MYSQL_PASSWORD` | generated, never asked | MySQL password |
+| | `OMEKA_TITLE` | `Omeka S` | Site title |
+| | `ACME_CA` | Let's Encrypt | HTTPS: another certificate authority, e.g. Let's Encrypt staging |
+| | `CADDY_TLS` | none | HTTPS: `internal` for a certificate from Caddy's own authority (no public domain needed) |
 
-Non-interactive examples:
+The last six only apply to a new installation. At the prompt the admin e-mail must be a real address, as password resets (and, with HTTPS, Let's Encrypt's expiry warnings) go there. Without prompts, set `OMEKA_ADMIN_EMAIL`, or change the placeholder in the Omeka admin later.
 
 ```bash
-# HTTP-only install on port 8080, all defaults
+# No prompts: HTTP only, on port 8080
 curl -fsSL https://raw.githubusercontent.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/main/setup.sh \
   | NONINTERACTIVE=true OMEKA_HTTP_PORT=8080 bash
 
-# Production install with HTTPS
+# No prompts: public site with HTTPS
 curl -fsSL https://raw.githubusercontent.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/main/setup.sh \
   | OMEKA_DOMAIN=omeka.example.edu OMEKA_ADMIN_EMAIL=you@example.edu NONINTERACTIVE=true bash
 ```
 
-## Releases, not moving targets
+## HTTPS
 
-The installer checks out the template's **latest release tag** (`v*`), so new installs always get a state that has passed the template's CI — development on the template's `main` branch can never break a one-click install. Use `--edge` if you deliberately want the newest unreleased state.
+With a domain name, the script switches on the template's bundled [Caddy](https://caddyserver.com/) container. Caddy gets a free Let's Encrypt certificate, renews it, redirects HTTP to HTTPS and sends HSTS (telling browsers to use HTTPS only). The login cookie becomes `Secure`, so it is never sent unencrypted. Nothing is installed on the host.
 
-### Keeping an installation up to date
+```
+Internet (80, 443) → Caddy container → nginx container → PHP-FPM → MySQL
+```
 
-Day-to-day updates use the template's own scripts, run from the installation directory (see the template's [Keeping it up to date](https://github.com/AM-Digital-Research-Environment/omeka-s-docker#keeping-it-up-to-date) for details):
+You need:
+
+- **A DNS A record**: the entry that tells the internet which server a name such as `omeka.example.edu` belongs to. It must point to the server's public IP address (plus an AAAA record if the server has IPv6). Your IT department or domain provider creates it.
+- **Ports 80 and 443 open and free.** A port is the numbered door a service listens on: 80 for HTTP, 443 for HTTPS. Both must be reachable from the internet, and no other program on the server may use them.
+
+The script checks both first. If the domain does not point to this server, it warns and asks whether to continue (without prompts it continues), because Let's Encrypt issues only 5 identical certificates per week and also limits failed attempts. HTTPS needs template v2.9.0 or later; with an older `--ref` the script stops.
+
+The first certificate can take a minute. Watch it arrive from the installation directory with `docker compose logs -f caddy` (look for "certificate obtained"). Certificates live in the `caddy_data` Docker volume: **keep it**, or Caddy requests new ones and may hit the weekly limit. `scripts/backup.sh` saves it.
+
+To experiment without using up the limit, use Let's Encrypt's staging service (browsers do not trust its certificates), then remove the `ACME_CA` line from `.env` and run `docker compose up -d`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/main/setup.sh \
+  | ACME_CA=https://acme-staging-v02.api.letsencrypt.org/directory bash -s -- --domain omeka.example.edu
+```
+
+More in the template's [Bundled HTTPS (Caddy)](https://github.com/AM-Digital-Research-Environment/omeka-s-docker/blob/main/docs/PRODUCTION.md#bundled-https-caddy).
+
+**Without HTTPS**, nginx listens on the chosen port, and the script sets `NGINX_TRUSTED_PROXY_CIDR=192.0.2.1/32` so nginx ignores client-supplied `X-Forwarded-*` headers (which could otherwise dodge the admin-login rate limit or pose as HTTPS). Plain HTTP is meant for test installs.
+
+### Installations from earlier versions of this script
+
+Earlier versions installed Caddy on the host (`/etc/caddy/Caddyfile`) in front of nginx on `127.0.0.1:8080`. These sites keep working: the script recognises them, leaves that Caddy alone and does not migrate them. To move to the bundled Caddy, follow the template's [Bundled HTTPS (Caddy)](https://github.com/AM-Digital-Research-Environment/omeka-s-docker/blob/main/docs/PRODUCTION.md#bundled-https-caddy). Until then their login cookie is **not** `Secure`: add `OMEKA_SESSION_COOKIE_SECURE=true` to `.env` and run `docker compose up -d php web` ([HTTPS settings](https://github.com/AM-Digital-Research-Environment/omeka-s-docker/blob/main/docs/PRODUCTION.md#https-settings-in-env)).
+
+## Running it again
+
+Running the script again on an installed site (a directory with a `.env`) is safe. It keeps `.env` unchanged, regenerates nothing, asks nothing beyond the installation directory, starts the site if needed, waits until it is healthy and prints the address. `--domain`, `--port`, `--ref` and `--edge` have no effect then: to change a setting, edit `.env` and run `docker compose up -d` in the installation directory.
+
+## If something goes wrong
+
+If the site is not healthy after 10 minutes, the script stops with exit status 2 and shows each service's status and the last lines of the application log. Look there for an error. Too little memory (under 4 GB) is the most common cause; a slow server may just need a few more minutes. To look further (put `sudo` in front if Docker says permission denied):
 
 ```bash
 cd /opt/omeka-s
-bash scripts/update-omeka.sh --dry-run   # see which Omeka S version it would move to
+docker compose ps           # which service is not healthy?
+docker compose logs php     # the application log
+docker compose logs caddy   # certificates (HTTPS only)
+docker compose up -d        # start everything again
+```
+
+If the first install failed, check the error output: if it shows the admin login, store it now. Otherwise, run the script again once the problem is fixed; it reuses its configuration and shows the login at the end. If you are stuck, [open an issue](https://github.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/issues) with the output (remove passwords first). For problems with the running site, see the template's [Troubleshooting](https://github.com/AM-Digital-Research-Environment/omeka-s-docker#troubleshooting).
+
+## Keeping an installation up to date
+
+Use the template's scripts from the installation directory (see its [Keeping it up to date](https://github.com/AM-Digital-Research-Environment/omeka-s-docker#keeping-it-up-to-date)):
+
+```bash
+cd /opt/omeka-s
+bash scripts/update-omeka.sh --dry-run   # which Omeka S version it would move to
 bash scripts/update-omeka.sh             # backs up, rebuilds, restores the old .env if the build fails
 bash scripts/update-extensions.sh        # modules and themes, in place (template v2.3.0 and later)
 ```
 
-To move to a newer **template release**, back up first:
+The installer deploys a release tag, so changes on the template's `main` branch never reach your site by themselves. The template does not document or test moving an installation to a newer **template release**. Read that release's notes first; these steps combine what it does document, a backup and a rebuild of the code images:
 
 ```bash
 cd /opt/omeka-s
 bash scripts/backup.sh
 git fetch --tags
 git checkout <new-tag>
-docker compose up -d --build
+bash scripts/rebuild-code.sh --pull   # rebuilds and restarts php and web
+docker compose up -d                  # applies changes to the other services
 ```
-
-## HTTPS with Caddy
-
-When you choose automatic HTTPS during setup (or pass `--domain`), the script:
-
-- Installs Caddy on the host as a systemd service
-- Binds nginx to `127.0.0.1:8080` (localhost only)
-- Configures Caddy to reverse-proxy ports 80/443 to the Docker stack
-- Automatically obtains and renews Let's Encrypt TLS certificates
-
-**Requirement:** A domain name with a DNS A record already pointing to your server.
-
-```
-Internet (HTTPS:443) → Caddy (host) → nginx (127.0.0.1:8080) → PHP-FPM → MySQL
-```
-
-Without Caddy, nginx binds `0.0.0.0` on the chosen port so the site is directly reachable, and the script sets `NGINX_TRUSTED_PROXY_CIDR=192.0.2.1/32` so nginx ignores client-supplied `X-Forwarded-For` / `X-Forwarded-Proto` headers (otherwise a client could dodge the admin-login rate limit or pose as HTTPS). The template honours this setting from `v2.3.0`; older releases ignore it and trust forwarded headers from any private address. Direct HTTP is meant for test installs; put TLS in front of a public site.
-
-## Supported Distributions
-
-- Ubuntu
-- Debian
-- Fedora
-- Rocky Linux
-- Alma Linux
-
-Other distributions will attempt Docker's convenience install script as a fallback.
 
 ## Requirements
 
-- A Linux server (see supported distributions above)
-- Root or sudo access
-- For HTTPS: a domain name pointing to the server
-- Recommended: 4 GB+ RAM, 10 GB+ free disk space. The template's default per-service memory limits add up to about 3.5 GiB; a 2 GB server installs but can run out of memory under load or during a module upgrade, and the script warns below that.
+- Ubuntu, Debian, Fedora, Rocky Linux or Alma Linux (others try Docker's convenience install script).
+- Root or `sudo` access.
+- Recommended: 4 GB of memory and 10 GB of free disk. A 2 GB server installs but can run out of memory under load or during a module upgrade.
+- For HTTPS: see [HTTPS](#https).
 
 ## Continuous testing
 
-A [weekly workflow](.github/workflows/e2e.yml) runs the installer end-to-end on a fresh runner against the latest template release and probes the resulting site, so breakage in the template↔installer contract surfaces here instead of on someone's new server.
+The [workflows](.github/workflows/) test the installer:
+
+- **Lint**: ShellCheck and the unit tests in `tests/`.
+- **HTTP install**: a full install on a fresh runner against the latest template release, with a real admin login, then a second run on the installed site.
+- **HTTPS install**: the same with the bundled Caddy, using Caddy's internal certificate authority.
+- **Docker installation**: the Docker setup on Debian, Ubuntu, Fedora and Rocky containers.
 
 ## Security
 
@@ -139,7 +165,7 @@ Please report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
 ## Related
 
-- **[omeka-s-docker](https://github.com/AM-Digital-Research-Environment/omeka-s-docker)** — the Docker template this script deploys (manual setup instructions, module management, configuration reference, deployment overlays)
+- **[omeka-s-docker](https://github.com/AM-Digital-Research-Environment/omeka-s-docker)**: the template this script deploys (manual setup, modules, configuration, deployment overlays)
 
 ## License
 

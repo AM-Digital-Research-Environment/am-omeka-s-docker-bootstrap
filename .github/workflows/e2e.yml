@@ -1,9 +1,20 @@
 name: E2E
 
-# Runs the one-click installer end-to-end on a fresh runner: clone the
-# omeka-s-docker template at its latest release, build, launch, and probe the
-# running site. The weekly schedule catches template releases or upstream
-# image changes that would break new installs even when this repo is idle.
+# Tests the one-click installer:
+#   lint            ShellCheck, bash -n and the unit tests in tests/ (no Docker)
+#   install         full HTTP install on a fresh runner: clone the template at
+#                   its latest release, build, launch, probe, log in as the
+#                   admin, then run setup.sh a second time on the same install
+#   install-https   full HTTPS install through the template's bundled Caddy,
+#                   with Caddy's internal CA (no DNS, no ACME)
+#   docker-install  the Docker package installation on each supported distro
+#                   family, inside a plain distro container
+# The weekly schedule catches template releases or upstream image changes that
+# would break new installs even when this repo is idle.
+#
+# Branch protection on main requires the check named "install": keep that job
+# id, without a matrix, and independent of the other jobs (a job skipped
+# because a job it needs failed would report as passing).
 
 on:
   push:
@@ -20,32 +31,106 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    # Explicit bash: -e plus -o pipefail (the implicit default has no pipefail).
+    shell: bash
+
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # v7.0.1 resolved 2026-11-20. Keep the human-readable version in this
+      # comment while pinning the action itself against tag retargeting.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Shell script syntax
+        run: |
+          for script in setup.sh tests/*.sh; do
+            bash -n "$script"
+          done
+
+      - name: ShellCheck
+        run: |
+          shellcheck --version
+          shellcheck -x --severity=warning setup.sh tests/*.sh
+
+      - name: Unit tests
+        env:
+          TEST_ROUNDS: "1000"
+        run: bash tests/run.sh
+
   install:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
+    env:
+      OMEKA_INSTALL_DIR: /opt/omeka-s
+      OMEKA_HTTP_PORT: "8080"
+      SITE_URL: http://127.0.0.1:8080
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Shell script syntax
         run: bash -n setup.sh
 
+      # Kept in a file, not in GITHUB_ENV: Compose prefers the shell's
+      # variables over .env, so an OMEKA_ADMIN_PASSWORD exported to every later
+      # step would end up in the php container on each `docker compose up`.
+      # The characters $ # " check the single-quoted .env values end to end.
+      - name: Generate the admin login
+        run: |
+          password="Ci-$(openssl rand -hex 12)-\$#\"x"
+          echo "::add-mask::${password}"
+          umask 077
+          printf '%s' "$password" > "$RUNNER_TEMP/admin-password"
+          echo "ADMIN_PASSWORD_FILE=$RUNNER_TEMP/admin-password" >> "$GITHUB_ENV"
+          echo "ADMIN_EMAIL=ci-admin@example.org" >> "$GITHUB_ENV"
+
       - name: Run one-click installer (non-interactive, HTTP on :8080)
         env:
           NONINTERACTIVE: "true"
-          OMEKA_INSTALL_DIR: /opt/omeka-s
-          OMEKA_HTTP_PORT: "8080"
-        run: bash setup.sh
+        run: |
+          OMEKA_ADMIN_EMAIL="$ADMIN_EMAIL" \
+          OMEKA_ADMIN_PASSWORD="$(cat "$ADMIN_PASSWORD_FILE")" \
+            bash setup.sh
 
       - name: Show deployed template ref
-        run: git -C /opt/omeka-s describe --tags --always
+        run: git -C "$OMEKA_INSTALL_DIR" describe --tags --always
 
-      - name: HTTP-only install trusts no forwarded headers
-        run: sudo grep -qx 'NGINX_TRUSTED_PROXY_CIDR=192.0.2.1/32' /opt/omeka-s/.env
+      - name: Check the generated .env
+        run: |
+          env_file="$OMEKA_INSTALL_DIR/.env"
+          env_text=$(sudo cat "$env_file")
+          require() {
+            grep -qxE -- "$1" <<< "$env_text" || { echo "::error::.env lacks a line matching: $1"; exit 1; }
+          }
+          forbid() {
+            if grep -qE -- "$1" <<< "$env_text"; then
+              echo "::error::.env has a line matching: $1"
+              exit 1
+            fi
+          }
+          # HTTP-only install: nginx on all interfaces, no forwarded headers trusted.
+          require 'NGINX_BIND=0\.0\.0\.0'
+          require 'NGINX_PORT=8080'
+          require 'NGINX_TRUSTED_PROXY_CIDR=192\.0\.2\.1/32'
+          require "OMEKA_SECRET_KEY='[A-Za-z0-9+/]{43}='"
+          require "MYSQL_PASSWORD='[A-Za-z0-9]{24}'"
+          forbid '^(COMPOSE_FILE|SERVER_NAME|ACME_[A-Z]+|CADDY_TLS)='
+          # The first-install admin block is gone once the install finished.
+          forbid '^OMEKA_ADMIN_'
+          forbid '^# (>>>|<<<) First admin account'
+          [[ "$(sudo stat -c %a "$env_file")" == 600 ]] || { echo "::error::.env is not mode 600"; exit 1; }
+          echo ".env: HTTP settings, OMEKA_SECRET_KEY, no admin credentials, mode 600: OK"
 
       - name: Probe the site
         run: |
-          url="http://127.0.0.1:8080"
+          url="$SITE_URL"
           deadline=$((SECONDS + 300))
           while :; do
             code=$(curl -s -o /dev/null -w '%{http_code}' "$url/" || true)
@@ -63,9 +148,240 @@ jobs:
           echo "GET /admin (followed) -> $code"
           [[ "$code" == "200" ]]
 
+      # One attempt only: the template rate-limits admin logins.
+      - name: Log in as the admin created by setup.sh
+        run: |
+          url="$SITE_URL"
+          jar="$RUNNER_TEMP/cookies"
+          page=$(curl -fsS -c "$jar" -b "$jar" "$url/login")
+          read -r csrf_name csrf_value < <(python3 -c '
+          import sys
+          from html.parser import HTMLParser
+          class Form(HTMLParser):
+              def handle_starttag(self, tag, attrs):
+                  a = dict(attrs)
+                  if tag == "input" and (a.get("name") or "").endswith("csrf"):
+                      print(a["name"], a.get("value") or "")
+                      raise SystemExit(0)
+          Form().feed(sys.stdin.read())
+          ' <<< "$page") || true
+          if [[ -z "${csrf_name:-}" ]]; then
+            echo "::error::No CSRF field found in the login form"
+            exit 1
+          fi
+          # The password goes in from its file, never on the command line.
+          headers=$(curl -sS -o /dev/null -D - -c "$jar" -b "$jar" \
+            --data-urlencode "email=$ADMIN_EMAIL" \
+            --data-urlencode "password@$ADMIN_PASSWORD_FILE" \
+            --data-urlencode "$csrf_name=$csrf_value" \
+            --data-urlencode "submit=Log in" \
+            "$url/login")
+          status=$(head -n1 <<< "$headers" | tr -d '\r')
+          location=$(grep -i '^location:' <<< "$headers" | tr -d '\r' || true)
+          echo "POST /login -> $status ${location}"
+          if ! grep -qE '^HTTP/[0-9.]+ 302' <<< "$status" || ! grep -qiE '^location: .*/admin' <<< "$location"; then
+            echo "::error::Login with the admin credentials passed to setup.sh failed"
+            exit 1
+          fi
+          admin=$(curl -fsS -b "$jar" "$url/admin")
+          grep -q '/logout' <<< "$admin" || { echo "::error::/admin is not the logged-in dashboard"; exit 1; }
+          echo "Admin login with OMEKA_ADMIN_EMAIL / OMEKA_ADMIN_PASSWORD: OK"
+
+      # setup.sh recreates php without the admin variables once the install
+      # is done, even though they came from its own shell environment (which
+      # Compose prefers over .env).
+      - name: Admin password is gone from the php container's environment
+        run: |
+          cd "$OMEKA_INSTALL_DIR"
+          if [[ -n "$(docker compose exec -T php printenv OMEKA_ADMIN_PASSWORD || true)" ]]; then
+            echo "::error::OMEKA_ADMIN_PASSWORD is still set in the php container"
+            exit 1
+          fi
+          echo "php container: OMEKA_ADMIN_PASSWORD not set: OK"
+
+      - name: Re-run setup.sh on the installed site
+        env:
+          NONINTERACTIVE: "true"
+        run: |
+          cd "$OMEKA_INSTALL_DIR"
+          sum_before=$(sudo sha256sum .env)
+          images_before=$(docker compose ps -q | xargs docker inspect -f '{{.Config.Image}} {{.Image}}' | sort)
+          cd "$GITHUB_WORKSPACE"
+
+          rc=0
+          bash setup.sh > "$RUNNER_TEMP/rerun.log" 2>&1 || rc=$?
+          cat "$RUNNER_TEMP/rerun.log"
+          echo "setup.sh (second run) exited $rc"
+          [[ "$rc" == 0 ]] || { echo "::error::The second run exited $rc"; exit 1; }
+
+          cd "$OMEKA_INSTALL_DIR"
+          sum_after=$(sudo sha256sum .env)
+          echo "before: $sum_before"
+          echo "after:  $sum_after"
+          [[ "$sum_before" == "$sum_after" ]] || { echo "::error::The second run changed .env"; exit 1; }
+          grep -qF 'Existing installation found' "$RUNNER_TEMP/rerun.log" \
+            || { echo "::error::The second run did not recognise the installation"; exit 1; }
+          if grep -qF 'Building the Docker image' "$RUNNER_TEMP/rerun.log"; then
+            echo "::error::The second run rebuilt the image"
+            exit 1
+          fi
+          images_after=$(docker compose ps -q | xargs docker inspect -f '{{.Config.Image}} {{.Image}}' | sort)
+          [[ "$images_before" == "$images_after" ]] || { echo "::error::Images changed on the second run"; exit 1; }
+          echo "Second run: exit 0, .env byte-identical, no rebuild: OK"
+
+      - name: Site still answers after the second run
+        run: |
+          deadline=$((SECONDS + 120))
+          while :; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$SITE_URL/" || true)
+            [[ "$code" =~ ^(200|30[123])$ ]] && break
+            if (( SECONDS > deadline )); then
+              echo "Front page did not answer after the second run (last code: $code)" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "GET / -> $code"
+
       - name: Service status and logs on failure
         if: failure()
         run: |
-          cd /opt/omeka-s || exit 0
+          cd "$OMEKA_INSTALL_DIR" || exit 0
           docker compose ps || true
           docker compose logs --tail 200 || true
+
+  install-https:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OMEKA_INSTALL_DIR: /opt/omeka-s
+      # Not in public DNS: every probe points it at 127.0.0.1 with --resolve.
+      OMEKA_DOMAIN: ci.example.org
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Nothing listens on 80/443 on ubuntu-latest (the template's own tls
+      # smoke test uses them too); setup.sh refuses to start if they are taken.
+      - name: Listening TCP ports before the install
+        run: sudo ss -Hltnp
+
+      - name: Run one-click installer (non-interactive, HTTPS with Caddy's internal CA)
+        env:
+          NONINTERACTIVE: "true"
+          CADDY_TLS: internal
+        run: bash setup.sh
+
+      - name: Show deployed template ref
+        run: git -C "$OMEKA_INSTALL_DIR" describe --tags --always
+
+      - name: Check the generated .env
+        run: |
+          env_file="$OMEKA_INSTALL_DIR/.env"
+          env_text=$(sudo cat "$env_file")
+          require() {
+            grep -qxE -- "$1" <<< "$env_text" || { echo "::error::.env lacks a line matching: $1"; exit 1; }
+          }
+          forbid() {
+            if grep -qE -- "$1" <<< "$env_text"; then
+              echo "::error::.env has a line matching: $1"
+              exit 1
+            fi
+          }
+          require_line() {
+            grep -qxF -- "$1" <<< "$env_text" || { echo "::error::.env lacks the line: $1"; exit 1; }
+          }
+          require_line 'COMPOSE_FILE=docker-compose.yml:compose.tls.yml'
+          require_line "SERVER_NAME=$OMEKA_DOMAIN"
+          require_line 'CADDY_TLS=internal'
+          require "OMEKA_SECRET_KEY='[A-Za-z0-9+/]{43}='"
+          # nginx is not published with HTTPS; the admin address is the
+          # example.com placeholder, so no ACME_EMAIL.
+          forbid '^NGINX_'
+          forbid '^ACME_EMAIL='
+          forbid '^OMEKA_ADMIN_'
+          [[ "$(sudo stat -c %a "$env_file")" == 600 ]] || { echo "::error::.env is not mode 600"; exit 1; }
+          echo ".env: tls overlay, SERVER_NAME, CADDY_TLS=internal, no NGINX_*, no admin credentials: OK"
+
+      - name: Probe the site through Caddy
+        run: |
+          host="$OMEKA_DOMAIN"
+          url="https://$host"
+          # Caddy answers only for SERVER_NAME, with a certificate from its
+          # internal CA: point the name at this machine and accept that CA.
+          curl() { command curl --resolve "$host:443:127.0.0.1" --resolve "$host:80:127.0.0.1" -k "$@"; }
+
+          deadline=$((SECONDS + 300))
+          while :; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$url/" || true)
+            [[ "$code" =~ ^(200|30[123])$ ]] && break
+            if (( SECONDS > deadline )); then
+              echo "Front page never came up through Caddy (last code: $code)" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "GET $url/ -> $code"
+
+          redirect=$(curl -sS -D - -o /dev/null "http://$host/admin?x=1" | tr -d '\r')
+          echo "$redirect" | head -n 5
+          grep -qE '^HTTP/[0-9.]+ 30[18]' <<< "$redirect" || { echo "::error::No HTTP->HTTPS redirect"; exit 1; }
+          grep -qiF "location: https://$host/admin?x=1" <<< "$redirect" || { echo "::error::Redirect does not keep host, path and query"; exit 1; }
+
+          headers=$(curl -sS -D - -o /dev/null "$url/application/asset/css/style.css" | tr -d '\r')
+          grep -qE '^HTTP/[0-9.]+ 200' <<< "$headers" || { echo "::error::Static asset not served over HTTPS"; exit 1; }
+          hsts=$(grep -ci '^strict-transport-security:' <<< "$headers" || true)
+          echo "Strict-Transport-Security headers: $hsts"
+          [[ "$hsts" == 1 ]] || { echo "::error::Expected exactly one Strict-Transport-Security header, got $hsts"; exit 1; }
+
+          cookie=$(curl -s -D - -o /dev/null "$url/login" | tr -d '\r' | grep -i '^set-cookie:' | head -n 1 || true)
+          echo "Session cookie flags: $(grep -oiE '(; *(httponly|secure|samesite=[a-z]+))+' <<< "$cookie" || true)"
+          grep -qiE ';[[:space:]]*secure' <<< "$cookie" || { echo "::error::Session cookie is not Secure"; exit 1; }
+          grep -qi 'httponly' <<< "$cookie" || { echo "::error::Session cookie is not HttpOnly"; exit 1; }
+
+          # Only Caddy faces the host; nginx is reached over the Docker network.
+          cd "$OMEKA_INSTALL_DIR"
+          [[ -z "$(docker port "$(docker compose ps -q web)")" ]] || { echo "::error::nginx is published on the host"; exit 1; }
+          echo "HTTP->HTTPS redirect, one HSTS header, Secure cookie, front page, nginx unpublished: OK"
+
+      - name: Service status and logs on failure
+        if: failure()
+        run: |
+          cd "$OMEKA_INSTALL_DIR" || exit 0
+          docker compose ps || true
+          docker compose logs --tail 200 || true
+
+  docker-install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:stable", "ubuntu:24.04", "fedora:latest", "rockylinux:9"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Packages only (repository, Engine, CLI, Compose and Buildx plugins), as
+      # root in a plain distro image; no daemon runs in the container, which
+      # the CLI's version commands do not need. git is installed afterwards,
+      # in the same order as a real run.
+      - name: Install Docker packages in ${{ matrix.image }}
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm -v "$PWD:/src:ro" "$IMAGE" bash -c '
+            set -euo pipefail
+            SETUP_SH_NO_MAIN=1 source /src/setup.sh
+            detect_distro
+            echo "Detected: $DISTRO_NAME (ID=$DISTRO_ID)"
+            detect_sudo
+            install_docker_packages
+            install_git
+            docker --version
+            docker compose version
+            docker buildx version
+            git --version
+          '
