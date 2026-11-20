@@ -124,6 +124,7 @@ BOOTSTRAP_REF="${BOOTSTRAP_REF:-}"
 DEPLOYED_REF=""
 ADMIN_EMAIL=""
 ADMIN_PASSWORD=""
+WAIT_TIMEOUT=600   # seconds `docker compose up --wait` may take
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -815,47 +816,48 @@ launch() {
     configure_firewall
 
     log_info "Building the Docker image (this may take a few minutes on first run)..."
-    $COMPOSE_CMD build --pull 2>&1 | while IFS= read -r line; do
-        echo -e "    ${line}"
-    done
-
-    log_info "Starting services..."
-    $COMPOSE_CMD up -d
-
-    # Wait for healthy state. First boot includes the Omeka S installation
-    # (database migrations, module setup), which takes a few minutes.
-    log_info "Waiting for services to become healthy..."
-    local max_wait=360
-    local waited=0
-    local all_healthy=false
-
-    while (( waited < max_wait )); do
-        # Check if all services are healthy
-        local unhealthy
-        unhealthy=$($COMPOSE_CMD ps --format '{{.Health}}' 2>/dev/null | grep -cv "healthy" || true)
-        if (( unhealthy == 0 )); then
-            all_healthy=true
-            break
-        fi
-        echo -ne "\r    Waiting... ${waited}s / ${max_wait}s"
-        sleep 5
-        waited=$((waited + 5))
-    done
-    echo "" # clear the \r line
-
-    if $all_healthy; then
-        log_ok "All services are healthy!"
-    else
-        log_warn "Some services are still starting. Check with:"
-        log_info "  cd ${PROJECT_DIR} && ${COMPOSE_CMD} ps"
-        log_info "  cd ${PROJECT_DIR} && ${COMPOSE_CMD} logs -f php"
+    if ! $COMPOSE_CMD build --pull 2>&1 | while IFS= read -r line; do
+        echo >&2 -e "    ${line}"
+    done; then
+        log_error "Building the Docker image failed (see the output above)."
+        log_info "A network hiccup is the usual cause: simply run this script again."
+        exit 1
     fi
+
+    start_and_wait
 
     # Start Caddy after Docker services are up
     if $ENABLE_CADDY; then
         configure_caddy
         start_caddy
     fi
+}
+
+# Starts the stack and blocks until every service reports healthy. First boot
+# includes the Omeka S installation (database, modules), which takes a few
+# minutes. Compose's own --wait fails on an unhealthy or exited container
+# instead of mistaking it for a healthy one, and returns non-zero on timeout.
+start_and_wait() {
+    log_info "Starting services and waiting until they are healthy (up to 10 minutes)..."
+    if $COMPOSE_CMD up -d --wait --wait-timeout "${WAIT_TIMEOUT}"; then
+        log_ok "All services are healthy"
+        return 0
+    fi
+
+    echo >&2 ""
+    log_error "Omeka S did not become healthy within $(( WAIT_TIMEOUT / 60 )) minutes."
+    echo >&2 ""
+    log_info "Service status:"
+    $COMPOSE_CMD ps >&2 || true
+    echo >&2 ""
+    log_info "Last lines of the php service log:"
+    $COMPOSE_CMD logs --no-color --tail 30 php >&2 || true
+    echo >&2 ""
+    log_info "What to do: read the log lines above for an error. A slow server may"
+    log_info "simply need more time: wait a few minutes, then check again with"
+    log_info "  cd ${PROJECT_DIR} && ${COMPOSE_CMD} ps"
+    log_info "Too little memory (under 4 GB) is the most common cause of a failed start."
+    exit 2
 }
 
 # ── Detect server IP ────────────────────────────────────────────────────────
