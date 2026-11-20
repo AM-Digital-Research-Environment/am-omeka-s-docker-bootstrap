@@ -460,6 +460,9 @@ install_git() {
 
     case "${DISTRO_ID}" in
         ubuntu|debian|linuxmint|pop)
+            # The package lists may be empty or stale when Docker was already
+            # there and nothing refreshed them.
+            $SUDO apt-get update -qq
             $SUDO apt-get install -y -qq git >/dev/null
             ;;
         fedora)
@@ -505,7 +508,6 @@ checkout_release() {
         git -C "${PROJECT_DIR}" checkout -q "${latest_tag}"
         DEPLOYED_REF="${latest_tag}"
         log_ok "Deployed template at latest release: ${latest_tag}"
-        log_info "To move to a newer template release later: 'bash scripts/backup.sh', then 'git fetch --tags' and checkout the new tag (see the summary at the end)."
     else
         DEPLOYED_REF="main (no releases found)"
         log_warn "No release tags found — using the main branch."
@@ -569,6 +571,10 @@ use_existing_checkout() {
     fi
     if [[ -f "${PROJECT_DIR}/.env" ]]; then
         EXISTING_INSTALL=true
+        if [[ -n "${OMEKA_DOMAIN:-}" || -n "${OMEKA_HTTP_PORT:-}" ]]; then
+            log_warn "--domain/--port only apply to a new installation; this one keeps the"
+            log_warn "address already set in ${PROJECT_DIR}/.env (edit that file to change it)."
+        fi
     fi
 }
 
@@ -779,8 +785,9 @@ require_free_ports() {
 # IPv4/IPv6 addresses configured on this host, one per line.
 host_addresses() {
     {
-        hostname -I 2>/dev/null | tr ' ' '\n'
-        ip -o addr show 2>/dev/null | awk '{ split($4, a, "/"); print a[1] }'
+        # Either tool may be missing; an empty list only softens the warning.
+        hostname -I 2>/dev/null | tr ' ' '\n' || true
+        ip -o addr show 2>/dev/null | awk '{ split($4, a, "/"); print a[1] }' || true
     } | sed '/^$/d' | sort -u
 }
 
@@ -1130,6 +1137,9 @@ finish_first_install() {
     log_step "Removing the admin password from .env"
     remove_admin_credentials
     log_ok "OMEKA_ADMIN_* removed from .env (only needed by the first install)"
+    # Compose prefers this shell's variables over .env: when the account came
+    # in through the environment, php would be recreated with it again.
+    unset OMEKA_ADMIN_EMAIL OMEKA_ADMIN_USERNAME OMEKA_ADMIN_PASSWORD
     start_and_wait
 }
 
