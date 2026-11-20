@@ -113,6 +113,8 @@ usage() {
 ENABLE_HTTPS=false
 DOMAIN_NAME="${OMEKA_DOMAIN:-}"
 HTTP_PORT="${OMEKA_HTTP_PORT:-80}"
+EXISTING_INSTALL=false     # true when the project directory already has a .env
+LEGACY_HOST_PROXY=false    # true for an old .env with Caddy on the host
 PROJECT_DIR=""
 COMPOSE_CMD="docker compose"
 DOCKER_CMD="docker"
@@ -423,6 +425,7 @@ clone_repo() {
     if [[ -f "docker-compose.yml" && -f "Dockerfile" && -f ".env.example" ]]; then
         PROJECT_DIR="$(pwd)"
         log_ok "Already inside the project directory: ${PROJECT_DIR}"
+        use_existing_checkout
         return
     fi
 
@@ -432,7 +435,8 @@ clone_repo() {
 
     if [[ -d "${install_dir}" && -f "${install_dir}/docker-compose.yml" ]]; then
         PROJECT_DIR="${install_dir}"
-        log_ok "Existing installation found at ${PROJECT_DIR}"
+        log_ok "Existing checkout found at ${PROJECT_DIR}"
+        use_existing_checkout
         return
     fi
 
@@ -460,7 +464,100 @@ clone_repo() {
     checkout_release
 }
 
-# ── HTTPS (the template's bundled Caddy) ─────────────────────────────────────
+# An existing checkout is used as it is: never moved to another ref. With a
+# .env it is an installed site (see detect_existing_install); without one it
+# gets a fresh configuration.
+use_existing_checkout() {
+    DEPLOYED_REF=$(git -C "${PROJECT_DIR}" describe --tags --always 2>/dev/null || echo "unknown")
+    log_info "Template checkout: ${DEPLOYED_REF} (left as it is)"
+    if [[ -n "${BOOTSTRAP_REF}" || "${EDGE}" == "true" ]]; then
+        log_warn "--ref/--edge only apply to a fresh clone; the existing checkout is not moved."
+    fi
+    if [[ -f "${PROJECT_DIR}/.env" ]]; then
+        EXISTING_INSTALL=true
+    fi
+}
+
+# ── Existing installation ────────────────────────────────────────────────────
+
+# Prints the value of KEY from the project's .env (last assignment wins, as in
+# Compose), without surrounding quotes or a trailing " # comment". Prints
+# nothing when the key is absent.
+env_value() {
+    local key="$1" line value
+    line=$(grep -E "^[[:space:]]*${key}=" "${PROJECT_DIR}/.env" | tail -n1 || true)
+    [[ -n "${line}" ]] || return 0
+    value="${line#*=}"
+    if [[ "${value}" =~ ^\'(.*)\'[[:space:]]*$ || "${value}" =~ ^\"(.*)\"[[:space:]]*$ ]]; then
+        value="${BASH_REMATCH[1]}"
+    else
+        value="${value%% #*}"
+        value="${value%"${value##*[![:space:]]}"}"
+    fi
+    printf '%s\n' "${value}"
+}
+
+# Derives the mode, domain and port from an existing .env without changing
+# it. Three layouts are recognised:
+#   - bundled Caddy:   COMPOSE_FILE lists compose.tls.yml, SERVER_NAME = domain
+#   - legacy host Caddy (written by earlier versions of this script):
+#                      NGINX_BIND=127.0.0.1 plus a SERVER_NAME; that Caddy is
+#                      left alone, the site is https://SERVER_NAME
+#   - plain HTTP:      NGINX_PORT (default 80)
+detect_existing_install() {
+    local compose_file server_name nginx_bind
+    compose_file=$(env_value COMPOSE_FILE)
+    server_name=$(env_value SERVER_NAME)
+    nginx_bind=$(env_value NGINX_BIND)
+    HTTP_PORT=$(env_value NGINX_PORT)
+    HTTP_PORT="${HTTP_PORT:-80}"
+    LEGACY_HOST_PROXY=false
+    # Compose prefers the shell's value over .env; so does the summary.
+    CADDY_TLS="${CADDY_TLS:-$(env_value CADDY_TLS)}"
+
+    if [[ ":${compose_file}:" == *":compose.tls.yml:"* ]]; then
+        ENABLE_HTTPS=true
+        DOMAIN_NAME="${server_name}"
+    elif [[ "${nginx_bind:-127.0.0.1}" == "127.0.0.1" && -n "${server_name}" && "${server_name}" != "_" ]]; then
+        ENABLE_HTTPS=false
+        LEGACY_HOST_PROXY=true
+        DOMAIN_NAME="${server_name}"
+    else
+        ENABLE_HTTPS=false
+        DOMAIN_NAME=""
+    fi
+}
+
+# Re-run on an installed site: nothing is asked, regenerated or rewritten.
+# The stack is (re)started with the configuration it already has.
+run_existing_install() {
+    log_step "Existing installation found at ${PROJECT_DIR}"
+    detect_existing_install
+    log_ok "Keeping the existing configuration (.env is not modified)"
+    if [[ "${ENABLE_HTTPS}" == "true" ]]; then
+        log_info "Mode: HTTPS via the bundled Caddy for ${DOMAIN_NAME}"
+    elif [[ "${LEGACY_HOST_PROXY}" == "true" ]]; then
+        log_info "Mode: behind the Caddy on this host for ${DOMAIN_NAME} (left untouched)"
+    else
+        log_info "Mode: HTTP on port ${HTTP_PORT}"
+    fi
+
+    cd "${PROJECT_DIR}"
+    log_step "Starting Omeka S"
+    # `up` builds the image only if it is missing; an installed site is not
+    # rebuilt behind the operator's back.
+    start_and_wait
+
+    # A first run that wrote .env but never got healthy leaves the admin block
+    # in it; the install has run now, so finish what that run started.
+    if grep -qxF "${ADMIN_BLOCK_START}" .env; then
+        ADMIN_EMAIL=$(env_value OMEKA_ADMIN_EMAIL)
+        ADMIN_PASSWORD=$(env_value OMEKA_ADMIN_PASSWORD)
+        finish_first_install
+    fi
+}
+
+# ── HTTPS (the template's bundled Caddy)─────────────────────────────────────
 
 # A single DNS name, as Caddy and nginx expect it in SERVER_NAME.
 valid_domain() {
@@ -684,14 +781,6 @@ configure_env() {
     log_step "Configuring environment"
 
     local env_file="${PROJECT_DIR}/.env"
-
-    if [[ -f "${env_file}" ]]; then
-        log_warn "An .env file already exists."
-        if ! ask_yes_no "Reconfigure it?" "n"; then
-            log_ok "Keeping existing configuration"
-            return
-        fi
-    fi
 
     echo ""
     echo -e "  ${BOLD}Let's configure your Omeka S instance:${NC}"
@@ -942,10 +1031,16 @@ start_and_wait() {
 # ── Detect server IP ────────────────────────────────────────────────────────
 
 get_server_ip() {
-    # Try to get the primary non-loopback IP
-    ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || \
-    hostname -I 2>/dev/null | awk '{print $1}' || \
-    echo "your-server-ip"
+    # The source address of the default route (no packet is sent), else the
+    # first configured address. Each step can print nothing without failing,
+    # so test the output rather than the exit status.
+    local addr
+    addr=$(ip -4 route get 1.1.1.1 2>/dev/null \
+        | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }' || true)
+    if [[ -z "${addr}" ]]; then
+        addr=$(hostname -I 2>/dev/null | awk '{ print $1 }' || true)
+    fi
+    echo "${addr:-your-server-ip}"
 }
 
 # ── Summary ──────────────────────────────────────────────────────────────────
@@ -955,7 +1050,7 @@ print_summary() {
     ip=$(get_server_ip)
 
     local url
-    if [[ "${ENABLE_HTTPS}" == "true" ]]; then
+    if [[ "${ENABLE_HTTPS}" == "true" || "${LEGACY_HOST_PROXY}" == "true" ]]; then
         url="https://${DOMAIN_NAME}"
     else
         url="http://${ip}"
@@ -966,17 +1061,36 @@ print_summary() {
 
     echo ""
     echo -e "${GREEN}"
-    cat << 'DONE'
+    if [[ "${EXISTING_INSTALL}" == "true" ]]; then
+        cat << 'DONE'
+  ╔══════════════════════════════════════════════════════════╗
+  ║              Omeka S is running                          ║
+  ╚══════════════════════════════════════════════════════════╝
+DONE
+    else
+        cat << 'DONE'
   ╔══════════════════════════════════════════════════════════╗
   ║              Setup Complete!                             ║
   ╚══════════════════════════════════════════════════════════╝
 DONE
+    fi
     echo -e "${NC}"
     echo -e "  ${BOLD}Access Omeka S at:${NC}  ${CYAN}${url}${NC}"
     if [[ -n "${DEPLOYED_REF}" ]]; then
         echo -e "  ${BOLD}Template version:${NC}   ${DEPLOYED_REF}"
     fi
     echo ""
+
+    if [[ "${EXISTING_INSTALL}" == "true" ]]; then
+        echo -e "  ${BOLD}Existing configuration kept:${NC} this run changed nothing in .env."
+        echo -e "  To change settings, edit ${PROJECT_DIR}/.env by hand, then run"
+        echo -e "  '${COMPOSE_CMD} up -d' in that directory."
+        if [[ "${LEGACY_HOST_PROXY}" == "true" ]]; then
+            echo -e "  HTTPS comes from the Caddy installed on this host by an earlier version"
+            echo -e "  of this script (/etc/caddy/Caddyfile); it was left untouched."
+        fi
+        echo ""
+    fi
 
     if [[ -n "${ADMIN_PASSWORD}" ]]; then
         echo -e "  ${BOLD}Admin login${NC} ${YELLOW}(shown only this once, not saved anywhere: store it now,${NC}"
@@ -994,9 +1108,11 @@ DONE
             echo -e "          (browsers warn until its root certificate is trusted)"
         else
             echo -e "  ${BOLD}HTTPS:${NC}  bundled Caddy container, automatic Let's Encrypt certificate"
-            echo -e "          The first certificate can take a minute; until then the browser"
-            echo -e "          may show a security error. Watch it arrive with"
-            echo -e "          ${COMPOSE_CMD} logs -f caddy   ${CYAN}# look for \"certificate obtained\"${NC}"
+            if [[ "${EXISTING_INSTALL}" != "true" ]]; then
+                echo -e "          The first certificate can take a minute; until then the browser"
+                echo -e "          may show a security error. Watch it arrive with"
+                echo -e "          ${COMPOSE_CMD} logs -f caddy   ${CYAN}# look for \"certificate obtained\"${NC}"
+            fi
         fi
         echo -e "          Keep the ${BOLD}caddy_data${NC} Docker volume: it holds the certificate."
         echo -e "          Deleting it forces new certificates, and Let's Encrypt allows only"
@@ -1039,9 +1155,13 @@ main() {
     preflight
     install_docker
     clone_repo
-    ask_https
-    configure_env
-    launch
+    if [[ "${EXISTING_INSTALL}" == "true" ]]; then
+        run_existing_install
+    else
+        ask_https
+        configure_env
+        launch
+    fi
     print_summary
 }
 
