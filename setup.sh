@@ -3,9 +3,12 @@
 # Omeka S Docker — One-Click Setup Script
 # =============================================================================
 # This script bootstraps a fresh Linux server with everything needed to run
-# Omeka S: installs Docker, clones the repository at its latest release,
-# configures the environment (optionally HTTPS through the template's bundled Caddy),
-# and launches the services.
+# Omeka S: installs Docker, clones the omeka-s-docker template at its latest
+# release, writes .env (with optional automatic HTTPS through the template's
+# bundled Caddy), starts the stack and waits until it is healthy.
+#
+# Run it again on an installed site (a project directory with a .env) and it
+# changes nothing: it keeps .env as it is and just brings the stack up.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/main/setup.sh | bash
@@ -13,9 +16,13 @@
 #   wget -qO- https://raw.githubusercontent.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/main/setup.sh | bash
 #   — or —
 #   bash setup.sh [options]    (if already downloaded)
+#   Options through a pipe:  curl -fsSL <url> | bash -s -- --domain omeka.example.edu
+#
+# The usage() function below prints the options and environment variables;
+# keep it in sync with this header.
 #
 # Options (each also settable via environment variable):
-#   -y, --yes, --non-interactive   Accept all defaults, never prompt  (NONINTERACTIVE=true)
+#   -y, --yes, --non-interactive   Never prompt, accept defaults      (NONINTERACTIVE=true)
 #   --dir <path>                   Installation directory             (OMEKA_INSTALL_DIR)
 #   --domain <name>                Domain name — enables HTTPS        (OMEKA_DOMAIN)
 #   --port <port>                  HTTP port when not using HTTPS     (OMEKA_HTTP_PORT)
@@ -24,17 +31,28 @@
 #   --ref <tag|branch|sha>         Deploy an exact template ref       (BOOTSTRAP_REF)
 #   -h, --help                     Show this help
 #
-# Additional environment variables:
-#   MYSQL_PASSWORD          MySQL password (default: auto-generated, never asked)
-#   OMEKA_ADMIN_EMAIL       Admin account email (default: admin@example.com)
-#   OMEKA_ADMIN_PASSWORD    Admin account password (default: auto-generated)
+# Additional environment variables (fresh installs only):
+#   MYSQL_PASSWORD          MySQL password (default: generated, never asked)
+#   OMEKA_ADMIN_EMAIL       Admin account email (asked; non-interactive
+#                           default: admin@example.com)
+#   OMEKA_ADMIN_PASSWORD    Admin account password (default: generated)
 #   OMEKA_TITLE             Site title (default: "Omeka S")
+#   ACME_CA                 HTTPS only: ACME directory URL, e.g. Let's Encrypt
+#                           staging, written to .env
+#   CADDY_TLS               HTTPS only: "internal" for a certificate from
+#                           Caddy's own CA (no public DNS needed), written to .env
 #
 # Prompts read from /dev/tty, so interactive use works with `curl | bash`.
 # Without a TTY (CI, cron), the script automatically switches to
 # non-interactive mode and accepts all defaults.
 #
-# Supports: Ubuntu, Debian, Fedora, Rocky/Alma Linux
+# Exit status: 0 on success, 2 when the stack was started but did not become
+# healthy in time, 1 for any other error.
+#
+# For tests: SETUP_SH_NO_MAIN=1 defines everything without running main, so
+# the script can be sourced.
+#
+# Supports: Ubuntu, Debian, Fedora, RHEL/CentOS/Rocky/Alma Linux
 # =============================================================================
 
 set -euo pipefail
@@ -61,10 +79,15 @@ log_info()  { echo >&2 -e "  ${CYAN}ℹ${NC} $*"; }
 # Interactivity: prompts must read from /dev/tty because with `curl | bash`
 # stdin is the script itself — a plain `read` would eat script lines.
 NONINTERACTIVE="${NONINTERACTIVE:-false}"
-if [[ "${NONINTERACTIVE}" != "true" ]] && { [[ ! -r /dev/tty ]] || [[ ! -w /dev/tty ]]; }; then
-    NONINTERACTIVE=true
-    log_warn "No TTY available — running non-interactively with defaults."
-fi
+
+detect_interactivity() {
+    # -r/-w on /dev/tty can succeed without a controlling terminal, so try to
+    # actually open it.
+    if [[ "${NONINTERACTIVE}" != "true" ]] && ! { true < /dev/tty > /dev/tty; } 2>/dev/null; then
+        NONINTERACTIVE=true
+        log_warn "No TTY available — running non-interactively with defaults."
+    fi
+}
 
 ask() {
     local prompt="$1" default="$2" reply=""
@@ -100,12 +123,57 @@ banner() {
   ╚══════════════════════════════════════════════════════════╝
 BANNER
     echo -e "${NC}"
-    echo -e "  This script will install Docker (if needed), configure,"
-    echo -e "  and launch a production-ready Omeka S instance.\n"
+    echo -e "  This script installs Docker (if needed), sets up Omeka S with a"
+    echo -e "  generated configuration (optionally with automatic HTTPS), starts"
+    echo -e "  it and waits until it is ready. On an existing installation it"
+    echo -e "  keeps the configuration and only starts the services.\n"
 }
 
+# Self-contained (no reading of $0): under `curl ... | bash -s -- --help`
+# there is no script file to read. Keep in sync with the header comment.
 usage() {
-    sed -n '2,40p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || true
+    cat << 'USAGE'
+Omeka S Docker — one-click setup
+
+Installs Docker if needed, clones the omeka-s-docker template at its latest
+release, writes .env, starts the stack and waits until it is healthy.
+On a directory that already has a .env, nothing is changed: the existing
+configuration is kept and the stack is started.
+
+Usage:
+  curl -fsSL https://raw.githubusercontent.com/AM-Digital-Research-Environment/am-omeka-s-docker-bootstrap/main/setup.sh | bash
+  curl -fsSL <same URL> | bash -s -- [options]
+  bash setup.sh [options]
+
+Options (each also settable via environment variable):
+  -y, --yes, --non-interactive   Never prompt, accept defaults      (NONINTERACTIVE=true)
+  --dir <path>                   Installation directory             (OMEKA_INSTALL_DIR)
+                                 default: /opt/omeka-s
+  --domain <name>                Domain name — enables HTTPS        (OMEKA_DOMAIN)
+  --port <port>                  HTTP port when not using HTTPS     (OMEKA_HTTP_PORT)
+                                 default: 80
+  --edge                         Deploy the template's main branch
+                                 instead of the latest release      (BOOTSTRAP_EDGE=true)
+  --ref <tag|branch|sha>         Deploy an exact template ref       (BOOTSTRAP_REF)
+  -h, --help                     Show this help
+
+Additional environment variables (fresh installs only):
+  MYSQL_PASSWORD          MySQL password (default: generated, never asked)
+  OMEKA_ADMIN_EMAIL       Admin account email (asked; non-interactive
+                          default: admin@example.com)
+  OMEKA_ADMIN_PASSWORD    Admin account password (default: generated)
+  OMEKA_TITLE             Site title (default: "Omeka S")
+  ACME_CA                 HTTPS only: ACME directory URL, e.g. Let's Encrypt
+                          staging, written to .env
+  CADDY_TLS               HTTPS only: "internal" for a certificate from
+                          Caddy's own CA (no public DNS needed), written to .env
+
+HTTPS uses the template's bundled Caddy (template v2.9.0 or later): the
+domain must point to this server and ports 80 and 443 must be free.
+
+Exit status: 0 on success, 2 when the stack was started but did not become
+healthy in time, 1 for any other error.
+USAGE
 }
 
 # ── Global state ─────────────────────────────────────────────────────────────
@@ -117,16 +185,17 @@ EXISTING_INSTALL=false     # true when the project directory already has a .env
 LEGACY_HOST_PROXY=false    # true for an old .env with Caddy on the host
 PROJECT_DIR=""
 COMPOSE_CMD="docker compose"
-DOCKER_CMD="docker"
 SUDO=""
 DISTRO_ID=""
 DISTRO_NAME=""
-DISTRO_FAMILY=""
 EDGE="${BOOTSTRAP_EDGE:-false}"
 BOOTSTRAP_REF="${BOOTSTRAP_REF:-}"
 DEPLOYED_REF=""
 ADMIN_EMAIL=""
 ADMIN_PASSWORD=""
+SITE_TITLE=""
+ENV_MYSQL_PASSWORD=""      # value written as MYSQL_PASSWORD
+ENV_SECRET_KEY=""          # value written as OMEKA_SECRET_KEY
 WAIT_TIMEOUT=600   # seconds `docker compose up --wait` may take
 ENV_WRITTEN=false          # true once this run wrote a fresh .env
 ADMIN_CREDS_REMOVED=false  # true once OMEKA_ADMIN_* left .env again
@@ -169,18 +238,40 @@ preflight() {
     fi
     log_ok "Running on Linux ($(uname -r))"
 
-    # Detect distro
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        DISTRO_ID="${ID}"
-        DISTRO_NAME="${PRETTY_NAME}"
-        DISTRO_FAMILY="${ID_LIKE:-${ID}}"
-    else
+    detect_distro
+    log_ok "Detected: ${DISTRO_NAME}"
+    detect_sudo
+    check_resources
+}
+
+# Sets DISTRO_ID and DISTRO_NAME from /etc/os-release (read in a subshell, so
+# its variables do not leak into this script).
+detect_distro() {
+    if [[ ! -f /etc/os-release ]]; then
         log_error "Cannot detect Linux distribution (/etc/os-release not found)."
         exit 1
     fi
-    log_ok "Detected: ${DISTRO_NAME}"
+    DISTRO_ID=$(. /etc/os-release && echo "${ID:-}")
+    DISTRO_NAME=$(. /etc/os-release && echo "${PRETTY_NAME:-${ID:-unknown}}")
+}
 
+# Sets SUDO: empty as root, "sudo" otherwise (Docker installation and the
+# firewall need root).
+detect_sudo() {
+    if [[ $EUID -ne 0 ]]; then
+        if ! command -v sudo &>/dev/null; then
+            log_error "This script needs root privileges. Run with: sudo bash setup.sh"
+            exit 1
+        fi
+        SUDO="sudo"
+        log_info "Will use sudo for system-level commands."
+    else
+        SUDO=""
+        log_ok "Running as root"
+    fi
+}
+
+check_resources() {
     # Check available RAM. The template recommends ~4 GB: its default
     # per-service memory ceilings add up to about 3.5 GiB. MemTotal sits a
     # little below a VM's nominal size (the kernel reserves some), so the
@@ -204,19 +295,6 @@ preflight() {
     else
         log_ok "Free disk: ${free_disk_gb} GB"
     fi
-
-    # Need root/sudo for Docker installation
-    if [[ $EUID -ne 0 ]]; then
-        if ! command -v sudo &>/dev/null; then
-            log_error "This script needs root privileges. Run with: sudo bash setup.sh"
-            exit 1
-        fi
-        SUDO="sudo"
-        log_info "Will use sudo for system-level commands."
-    else
-        SUDO=""
-        log_ok "Running as root"
-    fi
 }
 
 # ── Docker installation ─────────────────────────────────────────────────────
@@ -236,23 +314,7 @@ install_docker() {
             exit 1
         fi
 
-        case "${DISTRO_ID}" in
-            ubuntu|debian|linuxmint|pop)
-                install_docker_debian
-                ;;
-            fedora)
-                install_docker_fedora
-                ;;
-            centos|rhel|rocky|almalinux|ol)
-                install_docker_rhel
-                ;;
-            *)
-                # Try the convenience script as a fallback
-                log_warn "Unsupported distro '${DISTRO_ID}'. Trying Docker's convenience script..."
-                install_docker_convenience
-                ;;
-        esac
-
+        install_docker_packages
         log_ok "Docker installed successfully"
     fi
 
@@ -289,13 +351,34 @@ install_docker() {
         $SUDO usermod -aG docker "$USER"
         log_warn "You may need to log out and back in for group changes to take effect."
         log_info "For now, the script will use sudo for docker commands."
-        # Re-define docker to use sudo for the rest of this script
-        DOCKER_CMD="sudo docker"
+        # Use sudo for compose for the rest of this script
         COMPOSE_CMD="sudo docker compose"
     else
-        DOCKER_CMD="docker"
         COMPOSE_CMD="docker compose"
     fi
+}
+
+# Adds Docker's package repository and installs Docker Engine with the
+# Compose and Buildx plugins. Packages only: no daemon start, systemd or
+# group changes, so it also runs in a plain distro container. Needs only
+# DISTRO_ID (detect_distro) and SUDO.
+install_docker_packages() {
+    case "${DISTRO_ID}" in
+        ubuntu|debian|linuxmint|pop)
+            install_docker_debian
+            ;;
+        fedora)
+            install_docker_fedora
+            ;;
+        centos|rhel|rocky|almalinux|ol)
+            install_docker_rhel
+            ;;
+        *)
+            # Try the convenience script as a fallback
+            log_warn "Unsupported distro '${DISTRO_ID}'. Trying Docker's convenience script..."
+            install_docker_convenience
+            ;;
+    esac
 }
 
 install_docker_debian() {
@@ -857,23 +940,20 @@ ask_admin_email() {
 configure_env() {
     log_step "Configuring environment"
 
-    local env_file="${PROJECT_DIR}/.env"
-
-    echo ""
-    echo -e "  ${BOLD}Let's configure your Omeka S instance:${NC}"
-    echo ""
+    echo >&2 ""
+    echo >&2 -e "  ${BOLD}Let's configure your Omeka S instance:${NC}"
+    echo >&2 ""
 
     # MySQL password: never asked. Nobody types it in anywhere, and a random
     # one is safer than anything chosen at a prompt.
-    local mysql_password
     if [[ -n "${MYSQL_PASSWORD:-}" ]]; then
-        mysql_password="${MYSQL_PASSWORD}"
+        ENV_MYSQL_PASSWORD="${MYSQL_PASSWORD}"
         log_ok "Using MySQL password from environment"
     else
-        mysql_password=$(generate_password)
+        ENV_MYSQL_PASSWORD=$(generate_password)
         log_ok "MySQL password generated (stored in .env)"
     fi
-    env_quote_check "MYSQL_PASSWORD" "${mysql_password}"
+    env_quote_check "MYSQL_PASSWORD" "${ENV_MYSQL_PASSWORD}"
 
     # Admin account: creating it here avoids the placeholder account the
     # template's installer would otherwise create.
@@ -888,9 +968,8 @@ configure_env() {
     env_quote_check "OMEKA_ADMIN_PASSWORD" "${ADMIN_PASSWORD}"
 
     # Site title
-    local site_title
-    site_title=$(ask "Site title" "${OMEKA_TITLE:-Omeka S}")
-    site_title=$(sanitize_title "${site_title}")
+    SITE_TITLE=$(ask "Site title" "${OMEKA_TITLE:-Omeka S}")
+    SITE_TITLE=$(sanitize_title "${SITE_TITLE}")
 
     # HTTP port. With HTTPS, the bundled Caddy owns ports 80/443 and nginx is
     # not published on the host at all.
@@ -905,15 +984,45 @@ configure_env() {
     # Checked before .env exists: a re-run with .env present keeps it as is.
     pre_launch_checks
 
-    local secret_key
-    secret_key=$(generate_secret_key)
-    if (( ${#secret_key} != 44 )); then
+    ENV_SECRET_KEY=$(generate_secret_key)
+    if (( ${#ENV_SECRET_KEY} != 44 )); then
         log_error "Could not generate OMEKA_SECRET_KEY (is base64 installed?)."
         exit 1
     fi
 
-    # Write .env
-    cat > "${env_file}" << EOF
+    write_env_file
+    ENV_WRITTEN=true
+    log_ok "Configuration saved to .env"
+}
+
+# Writes ${PROJECT_DIR}/.env from variables only (no prompts), mode 0600:
+#   ENV_MYSQL_PASSWORD, ENV_SECRET_KEY, ADMIN_EMAIL, ADMIN_PASSWORD,
+#   SITE_TITLE, DEPLOYED_REF (comment only), ENABLE_HTTPS, and then
+#   HTTPS:  DOMAIN_NAME, optional ACME_CA and CADDY_TLS
+#   HTTP:   HTTP_PORT
+# Exits if a value cannot be written safely (see env_quote_ok).
+write_env_file() {
+    local env_file="${PROJECT_DIR}/.env"
+    local tmp_file="${env_file}.tmp.$$"
+
+    env_quote_check "MYSQL_PASSWORD" "${ENV_MYSQL_PASSWORD}"
+    env_quote_check "OMEKA_SECRET_KEY" "${ENV_SECRET_KEY}"
+    env_quote_check "OMEKA_ADMIN_EMAIL" "${ADMIN_EMAIL}"
+    env_quote_check "OMEKA_ADMIN_PASSWORD" "${ADMIN_PASSWORD}"
+    env_quote_check "OMEKA_TITLE" "${SITE_TITLE}"
+
+    # Built in a file only the owner can read, then moved into place.
+    (
+        umask 077
+        render_env > "${tmp_file}"
+    )
+    chmod 600 "${tmp_file}"
+    mv -f "${tmp_file}" "${env_file}"
+}
+
+# Prints the .env content for write_env_file.
+render_env() {
+    cat << EOF
 # Omeka S Docker — Generated by setup.sh on $(date -Iseconds)
 # Template ref: ${DEPLOYED_REF:-unknown}
 
@@ -921,12 +1030,12 @@ configure_env() {
 # and spaces need no escaping), but cannot contain a single quote.
 
 # MySQL password
-MYSQL_PASSWORD='${mysql_password}'
+MYSQL_PASSWORD='${ENV_MYSQL_PASSWORD}'
 
 # Encryption key for secrets Omeka stores (module API keys and similar).
 # NEVER change it after the first start: anything already encrypted with it
 # becomes unreadable. Back it up together with the rest of this file.
-OMEKA_SECRET_KEY='${secret_key}'
+OMEKA_SECRET_KEY='${ENV_SECRET_KEY}'
 
 ${ADMIN_BLOCK_START}
 # Read only by the very first start, which creates this account. setup.sh
@@ -937,13 +1046,13 @@ OMEKA_ADMIN_USERNAME='admin'
 OMEKA_ADMIN_PASSWORD='${ADMIN_PASSWORD}'
 ${ADMIN_BLOCK_END}
 
-OMEKA_TITLE='${site_title}'
+OMEKA_TITLE='${SITE_TITLE}'
 EOF
 
     if [[ "${ENABLE_HTTPS}" == "true" ]]; then
         # nginx keeps the template's default NGINX_TRUSTED_PROXY_CIDR, which
         # covers the Docker bridge Caddy connects from.
-        cat >> "${env_file}" << EOF
+        cat << EOF
 
 # HTTPS: the template's bundled Caddy (compose.tls.yml) listens on ports 80
 # and 443 and obtains and renews the certificate for SERVER_NAME by itself.
@@ -953,19 +1062,19 @@ COMPOSE_FILE=docker-compose.yml:compose.tls.yml
 SERVER_NAME=${DOMAIN_NAME}
 EOF
         if ! is_placeholder_email "${ADMIN_EMAIL}"; then
-            echo "ACME_EMAIL='${ADMIN_EMAIL}'" >> "${env_file}"
+            echo "ACME_EMAIL='${ADMIN_EMAIL}'"
         fi
         if [[ -n "${ACME_CA:-}" ]]; then
-            echo "ACME_CA=${ACME_CA}" >> "${env_file}"
+            echo "ACME_CA=${ACME_CA}"
         fi
         if [[ -n "${CADDY_TLS:-}" ]]; then
-            echo "CADDY_TLS=${CADDY_TLS}" >> "${env_file}"
+            echo "CADDY_TLS=${CADDY_TLS}"
         fi
     else
         # With no proxy in front, nginx must not believe client-supplied
         # X-Forwarded-For / X-Forwarded-Proto: that would let a client dodge the
         # admin-login rate limit and pose as HTTPS.
-        cat >> "${env_file}" << EOF
+        cat << EOF
 
 # Where nginx listens on the host: all interfaces, so the site is reachable
 # from outside.
@@ -979,10 +1088,6 @@ NGINX_PORT=${HTTP_PORT}
 NGINX_TRUSTED_PROXY_CIDR=192.0.2.1/32
 EOF
     fi
-
-    chmod 600 "${env_file}"
-    ENV_WRITTEN=true
-    log_ok "Configuration saved to .env"
 }
 
 # The template reads OMEKA_ADMIN_* only on the first install, and the php
@@ -1232,6 +1337,7 @@ DONE
 
 main() {
     parse_args "$@"
+    detect_interactivity
     banner
     preflight
     install_docker
@@ -1246,4 +1352,9 @@ main() {
     print_summary
 }
 
-main "$@"
+# The last statement, so a truncated download never runs a partial script.
+# SETUP_SH_NO_MAIN=1 only defines the functions (for tests that source this
+# file). Not based on BASH_SOURCE, which `curl | bash` does not set usefully.
+if [[ "${SETUP_SH_NO_MAIN:-}" != "1" ]]; then
+    main "$@"
+fi
