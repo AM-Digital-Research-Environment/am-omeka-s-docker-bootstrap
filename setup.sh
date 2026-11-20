@@ -258,7 +258,17 @@ install_docker() {
         log_ok "Docker Compose v2: $(docker compose version --short 2>/dev/null)"
     else
         log_error "Docker Compose v2 plugin not found."
-        log_info "Install it with: ${SUDO} apt-get install docker-compose-plugin"
+        case "${DISTRO_ID}" in
+            ubuntu|debian|linuxmint|pop)
+                log_info "Install it with: ${SUDO:+${SUDO} }apt-get install docker-compose-plugin" ;;
+            fedora)
+                log_info "Install it with: ${SUDO:+${SUDO} }dnf install docker-compose-plugin" ;;
+            centos|rhel|rocky|almalinux|ol)
+                log_info "Install it with: ${SUDO:+${SUDO} }yum install docker-compose-plugin" ;;
+            *)
+                log_info "Install Docker's Compose v2 plugin: https://docs.docker.com/compose/install/linux/" ;;
+        esac
+        log_info "(It comes from Docker's own package repository, not the distribution's.)"
         exit 1
     fi
 
@@ -314,11 +324,16 @@ install_docker_debian() {
 install_docker_fedora() {
     log_info "Installing Docker for Fedora..."
 
+    local repo_url="https://download.docker.com/linux/fedora/docker-ce.repo"
     $SUDO dnf -y install dnf-plugins-core >/dev/null
-    $SUDO dnf-3 config-manager --add-repo \
-        https://download.docker.com/linux/fedora/docker-ce.repo 2>/dev/null || \
-    $SUDO dnf config-manager addrepo --from-repofile=\
-        https://download.docker.com/linux/fedora/docker-ce.repo 2>/dev/null
+    # Fedora 41+ ships dnf5, whose config-manager has a different syntax.
+    # Errors stay visible: a failure here would otherwise end the script
+    # silently under `set -e`.
+    if command -v dnf5 &>/dev/null; then
+        $SUDO dnf config-manager addrepo --overwrite --from-repofile="${repo_url}"
+    else
+        $SUDO dnf config-manager --add-repo "${repo_url}"
+    fi
     $SUDO dnf install -y docker-ce docker-ce-cli containerd.io \
         docker-buildx-plugin docker-compose-plugin >/dev/null
 }
