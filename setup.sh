@@ -4,7 +4,7 @@
 # =============================================================================
 # This script bootstraps a fresh Linux server with everything needed to run
 # Omeka S: installs Docker, clones the repository at its latest release,
-# configures the environment, optionally installs Caddy for automatic HTTPS,
+# configures the environment (optionally HTTPS through the template's bundled Caddy),
 # and launches the services.
 #
 # Usage:
@@ -17,8 +17,8 @@
 # Options (each also settable via environment variable):
 #   -y, --yes, --non-interactive   Accept all defaults, never prompt  (NONINTERACTIVE=true)
 #   --dir <path>                   Installation directory             (OMEKA_INSTALL_DIR)
-#   --domain <name>                Domain name — implies HTTPS/Caddy  (OMEKA_DOMAIN)
-#   --port <port>                  HTTP port when not using Caddy     (OMEKA_HTTP_PORT)
+#   --domain <name>                Domain name — enables HTTPS        (OMEKA_DOMAIN)
+#   --port <port>                  HTTP port when not using HTTPS     (OMEKA_HTTP_PORT)
 #   --edge                         Deploy the template's main branch
 #                                  instead of the latest release      (BOOTSTRAP_EDGE=true)
 #   --ref <tag|branch|sha>         Deploy an exact template ref       (BOOTSTRAP_REF)
@@ -110,8 +110,9 @@ usage() {
 
 # ── Global state ─────────────────────────────────────────────────────────────
 
-ENABLE_CADDY=false
+ENABLE_HTTPS=false
 DOMAIN_NAME="${OMEKA_DOMAIN:-}"
+HTTP_PORT="${OMEKA_HTTP_PORT:-80}"
 PROJECT_DIR=""
 COMPOSE_CMD="docker compose"
 DOCKER_CMD="docker"
@@ -459,220 +460,204 @@ clone_repo() {
     checkout_release
 }
 
-# ── HTTPS / Caddy ────────────────────────────────────────────────────────────
+# ── HTTPS (the template's bundled Caddy) ─────────────────────────────────────
+
+# A single DNS name, as Caddy and nginx expect it in SERVER_NAME.
+valid_domain() {
+    [[ "$1" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]
+}
 
 ask_https() {
     log_step "HTTPS Configuration"
 
     # A domain passed via --domain / OMEKA_DOMAIN implies HTTPS.
     if [[ -n "${DOMAIN_NAME}" ]]; then
-        ENABLE_CADDY=true
+        DOMAIN_NAME="${DOMAIN_NAME,,}"
+        if ! valid_domain "${DOMAIN_NAME}"; then
+            log_error "'${DOMAIN_NAME}' is not a valid domain name (expected something like omeka.example.edu)."
+            exit 1
+        fi
+        ENABLE_HTTPS=true
         log_ok "HTTPS will be enabled for ${DOMAIN_NAME} (domain provided)"
-        log_info "Make sure ${DOMAIN_NAME} has a DNS A record pointing to this server."
-        return
-    fi
-
-    if [[ "${NONINTERACTIVE}" == "true" ]]; then
-        ENABLE_CADDY=false
+    elif [[ "${NONINTERACTIVE}" == "true" ]]; then
+        ENABLE_HTTPS=false
         log_ok "Non-interactive: HTTP only (pass --domain or set OMEKA_DOMAIN for HTTPS)"
         return
-    fi
-
-    echo ""
-    echo -e "  Caddy can provide ${BOLD}automatic HTTPS${NC} with Let's Encrypt certificates."
-    echo -e "  This requires a domain name already pointing to this server."
-    echo ""
-    echo -e "  ${BOLD}1)${NC} Yes  — set up automatic HTTPS (recommended for production)"
-    echo -e "  ${BOLD}2)${NC} No   — use HTTP only (for local/dev or behind an existing proxy)"
-    echo ""
-
-    if ask_yes_no "Enable automatic HTTPS with Caddy?" "y"; then
-        ENABLE_CADDY=true
-
-        DOMAIN_NAME=$(ask "Domain name (e.g. omeka.example.edu)" "")
-
-        while [[ -z "${DOMAIN_NAME}" ]]; do
-            log_warn "A domain name is required for HTTPS."
-            DOMAIN_NAME=$(ask "Domain name (e.g. omeka.example.edu)" "")
-        done
-
-        # Basic domain format validation
-        if [[ ! "${DOMAIN_NAME}" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
-            log_warn "That doesn't look like a valid domain. Continuing anyway."
-        fi
-
-        log_ok "HTTPS will be enabled for ${DOMAIN_NAME}"
-        echo ""
-        log_info "Make sure ${DOMAIN_NAME} has a DNS A record pointing to this server."
-        log_info "Caddy will automatically obtain a certificate from Let's Encrypt."
     else
-        ENABLE_CADDY=false
-        log_ok "Skipping HTTPS — Omeka S will be available over HTTP"
+        echo >&2 ""
+        echo >&2 -e "  Omeka S can be served over ${BOLD}HTTPS${NC} with a free, automatically renewed"
+        echo >&2 -e "  Let's Encrypt certificate. This needs a domain name whose DNS already"
+        echo >&2 -e "  points to this server, and ports 80 and 443 reachable from the internet."
+        echo >&2 ""
+        echo >&2 -e "  ${BOLD}y${NC} — set up automatic HTTPS (recommended for a public site)"
+        echo >&2 -e "  ${BOLD}n${NC} — HTTP only (local/test machine, or behind an existing proxy)"
+        echo >&2 ""
+
+        if ! ask_yes_no "Enable automatic HTTPS?" "y"; then
+            ENABLE_HTTPS=false
+            log_ok "Skipping HTTPS — Omeka S will be available over HTTP"
+            return
+        fi
+        ENABLE_HTTPS=true
+        while :; do
+            DOMAIN_NAME=$(ask "Domain name (e.g. omeka.example.edu)" "")
+            DOMAIN_NAME="${DOMAIN_NAME,,}"
+            if valid_domain "${DOMAIN_NAME}"; then
+                break
+            fi
+            log_warn "Please enter a domain name such as omeka.example.edu (no http://, no slash)."
+        done
+        log_ok "HTTPS will be enabled for ${DOMAIN_NAME}"
     fi
-}
 
-install_caddy() {
-    log_step "Installing Caddy"
+    require_tls_overlay
 
-    if command -v caddy &>/dev/null; then
-        local caddy_version
-        caddy_version=$(caddy version 2>/dev/null || true)
-        log_ok "Caddy already installed: ${caddy_version}"
-        return
-    fi
-
-    log_info "Installing Caddy web server..."
-
-    case "${DISTRO_ID}" in
-        ubuntu|debian|linuxmint|pop)
-            install_caddy_debian
-            ;;
-        fedora)
-            install_caddy_fedora
-            ;;
-        centos|rhel|rocky|almalinux|ol)
-            install_caddy_rhel
-            ;;
+    case "${CADDY_TLS:-}" in
+        ""|acme|internal) ;;
         *)
-            log_warn "Unsupported distro for Caddy package install. Trying static binary..."
-            install_caddy_static
-            ;;
-    esac
-
-    log_ok "Caddy installed: $(caddy version 2>/dev/null)"
-}
-
-install_caddy_debian() {
-    $SUDO apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl >/dev/null
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | \
-        $SUDO gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | \
-        $SUDO tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
-    $SUDO chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-    $SUDO chmod o+r /etc/apt/sources.list.d/caddy-stable.list
-    $SUDO apt-get update -qq
-    $SUDO apt-get install -y -qq caddy >/dev/null
-}
-
-install_caddy_fedora() {
-    $SUDO dnf install -y 'dnf-command(copr)' >/dev/null 2>&1 || \
-        $SUDO dnf install -y dnf-plugins-core >/dev/null 2>&1 || true
-    $SUDO dnf copr enable -y @caddy/caddy >/dev/null 2>&1
-    $SUDO dnf install -y caddy >/dev/null
-}
-
-install_caddy_rhel() {
-    $SUDO yum install -y yum-plugin-copr >/dev/null 2>&1 || \
-        $SUDO dnf install -y 'dnf-command(copr)' >/dev/null 2>&1 || true
-    $SUDO dnf copr enable -y @caddy/caddy >/dev/null 2>&1 || \
-        $SUDO yum copr enable -y @caddy/caddy >/dev/null 2>&1
-    $SUDO dnf install -y caddy >/dev/null 2>&1 || \
-        $SUDO yum install -y caddy >/dev/null
-}
-
-install_caddy_static() {
-    # Fallback: download the latest static binary
-    local arch
-    arch=$(uname -m)
-    case "${arch}" in
-        x86_64)  arch="amd64" ;;
-        aarch64) arch="arm64" ;;
-        armv7l)  arch="armv7" ;;
-        *)
-            log_error "Unsupported architecture: ${arch}"
+            log_error "CADDY_TLS must be 'acme' or 'internal' (got '${CADDY_TLS}')."
             exit 1
             ;;
     esac
-
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-    curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=${arch}" \
-        -o "${tmp_dir}/caddy"
-    chmod +x "${tmp_dir}/caddy"
-    $SUDO mv "${tmp_dir}/caddy" /usr/bin/caddy
-    rm -rf "${tmp_dir}"
-
-    # Create caddy user and group
-    $SUDO groupadd --system caddy 2>/dev/null || true
-    $SUDO useradd --system --gid caddy --create-home --home-dir /var/lib/caddy --shell /usr/sbin/nologin caddy 2>/dev/null || true
-
-    # Install the systemd unit
-    $SUDO mkdir -p /etc/caddy
-    cat << 'UNIT' | $SUDO tee /etc/systemd/system/caddy.service >/dev/null
-[Unit]
-Description=Caddy
-Documentation=https://caddyserver.com/docs/
-After=network.target network-online.target
-Requires=network-online.target
-
-[Service]
-Type=notify
-User=caddy
-Group=caddy
-ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
-ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
-TimeoutStopSec=5s
-LimitNOFILE=1048576
-LimitNPROC=512
-PrivateTmp=true
-ProtectSystem=full
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-    $SUDO systemctl daemon-reload
+    if [[ -n "${ACME_CA:-}" && ! "${ACME_CA}" =~ ^https://[^[:space:]\'\"\#]+$ ]]; then
+        log_error "ACME_CA must be an https:// URL (got '${ACME_CA}')."
+        exit 1
+    fi
 }
 
-configure_caddy() {
-    log_step "Configuring Caddy for ${DOMAIN_NAME}"
-
-    local caddyfile="/etc/caddy/Caddyfile"
-
-    # Write the Caddyfile
-    cat << EOF | $SUDO tee "${caddyfile}" >/dev/null
-# Omeka S reverse proxy — generated by setup.sh
-# Caddy automatically obtains and renews TLS certificates from Let's Encrypt.
-
-${DOMAIN_NAME} {
-    reverse_proxy 127.0.0.1:8080 {
-        # Pass real client IP to Omeka S (used by nginx's real_ip module)
-        header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-For {remote_host}
-        header_up X-Forwarded-Proto {scheme}
-    }
-
-    # Reasonable request body limit (matches Omeka S PHP upload limit)
-    request_body {
-        max_size 100MB
-    }
-
-    # Access log
-    log {
-        output file /var/log/caddy/omeka-access.log
-    }
-}
-EOF
-
-    $SUDO mkdir -p /var/log/caddy
-    $SUDO chown caddy:caddy /var/log/caddy
-
-    log_ok "Caddyfile written to ${caddyfile}"
+# HTTPS comes from the template's compose.tls.yml overlay, added in v2.9.0.
+# Stop rather than fall back to HTTP: the user asked for HTTPS.
+require_tls_overlay() {
+    if [[ -f "${PROJECT_DIR}/compose.tls.yml" ]]; then
+        return
+    fi
+    log_error "HTTPS needs template v2.9.0 or later, but the checkout in ${PROJECT_DIR}"
+    log_error "(${DEPLOYED_REF:-unknown ref}) has no compose.tls.yml."
+    log_info "Re-run without --ref / BOOTSTRAP_REF to get the latest release, or with"
+    log_info "--ref v2.9.0 or newer. For an existing checkout: git -C ${PROJECT_DIR} fetch --tags"
+    log_info "and check out a newer tag. Or leave out --domain to install HTTP only."
+    exit 1
 }
 
-start_caddy() {
-    log_info "Starting Caddy..."
-    $SUDO systemctl enable caddy >/dev/null 2>&1
-    $SUDO systemctl restart caddy
+# Prints the listening socket(s) on a TCP port and succeeds if there is one.
+# Without ss nothing can be checked, so the port counts as free.
+port_listeners() {
+    local port="$1" out
+    command -v ss &>/dev/null || return 1
+    out=$($SUDO ss -Hltnp "sport = :${port}" 2>/dev/null) || return 1
+    [[ -n "${out}" ]] || return 1
+    printf '%s\n' "${out}"
+}
 
-    # Brief check that Caddy started
-    sleep 2
-    if $SUDO systemctl is-active --quiet caddy; then
-        log_ok "Caddy is running"
+# Exits with a hint when something already listens on one of the ports.
+require_free_ports() {
+    local port listeners program busy=false
+    if ! command -v ss &>/dev/null; then
+        log_warn "Cannot check whether port(s) $* are free ('ss' is not installed)."
+        return
+    fi
+    for port in "$@"; do
+        if listeners=$(port_listeners "${port}"); then
+            busy=true
+            program=$(grep -o 'users:(("[^"]*"' <<< "${listeners}" | head -n1 | cut -d'"' -f2 || true)
+            log_error "Port ${port} is already in use${program:+ by '${program}'}."
+            case "${program}" in
+                docker-proxy)
+                    log_info "  Another Docker container publishes it: see 'docker ps'. An earlier"
+                    log_info "  Omeka S stack can be stopped with 'docker compose down' in its directory." ;;
+                nginx|apache2|httpd|caddy|lighttpd|traefik|haproxy)
+                    log_info "  Another web server runs on this machine. If it is not needed:"
+                    log_info "    sudo systemctl disable --now ${program}" ;;
+                *)
+                    log_info "  See what it is with: sudo ss -ltnp 'sport = :${port}'" ;;
+            esac
+        fi
+    done
+    if [[ "${busy}" == "true" ]]; then
+        if [[ "${ENABLE_HTTPS}" == "true" ]]; then
+            log_info "HTTPS needs ports 80 and 443 to itself. Free them, or install HTTP only on"
+            log_info "another port (--port 8080, no --domain) behind the existing web server."
+        else
+            log_info "Choose another port (--port, or OMEKA_HTTP_PORT), or free this one."
+        fi
+        exit 1
+    fi
+    log_ok "Port(s) $* free"
+}
+
+# IPv4/IPv6 addresses configured on this host, one per line.
+host_addresses() {
+    {
+        hostname -I 2>/dev/null | tr ' ' '\n'
+        ip -o addr show 2>/dev/null | awk '{ split($4, a, "/"); print a[1] }'
+    } | sed '/^$/d' | sort -u
+}
+
+# Warns (and asks, interactively) when the domain does not resolve, or not to
+# this host. Let's Encrypt validates over the public DNS, so a wrong record
+# means failed attempts, and repeated failures run into its rate limits.
+check_domain_dns() {
+    if [[ "${CADDY_TLS:-}" == "internal" ]]; then
+        log_info "CADDY_TLS=internal: certificate from Caddy's own CA, DNS not checked."
+        return
+    fi
+    if ! command -v getent &>/dev/null; then
+        log_warn "Cannot check DNS for ${DOMAIN_NAME} ('getent' is not available)."
+        return
+    fi
+
+    local resolved own match=false
+    resolved=$(getent ahosts "${DOMAIN_NAME}" 2>/dev/null | awk '{ print $1 }' | sort -u || true)
+
+    if [[ -z "${resolved}" ]]; then
+        log_warn "${BOLD}${DOMAIN_NAME} does not resolve to any address.${NC}"
+        log_warn "Caddy cannot get a certificate until the domain has a DNS A record"
+        log_warn "(and AAAA for IPv6) pointing to this server's public IP address."
+        log_warn "Let's Encrypt allows only 5 identical certificates per week and limits"
+        log_warn "failed attempts too, so create the record first and wait until it works:"
+        log_info "  getent ahosts ${DOMAIN_NAME}"
+        if [[ "${NONINTERACTIVE}" == "true" ]]; then
+            log_warn "Non-interactive: continuing anyway. Caddy retries on its own once DNS works."
+            return
+        fi
+        if ! ask_yes_no "Continue anyway?" "n"; then
+            log_error "Stopped. Set up DNS, then run this script again."
+            exit 1
+        fi
+        return
+    fi
+
+    own=$(host_addresses)
+    local addr
+    while IFS= read -r addr; do
+        if grep -qxF -- "${addr}" <<< "${own}"; then
+            match=true
+            break
+        fi
+    done <<< "${resolved}"
+
+    if [[ "${match}" == "true" ]]; then
+        log_ok "${DOMAIN_NAME} resolves to this server"
+        return
+    fi
+    log_warn "${DOMAIN_NAME} resolves to $(tr '\n' ' ' <<< "${resolved}")but none of"
+    log_warn "these addresses is configured on this server."
+    log_warn "That is normal behind NAT or on cloud servers whose public IP is not on the"
+    log_warn "network interface. Otherwise fix the DNS record, or the certificate will fail."
+    if [[ "${NONINTERACTIVE}" != "true" ]] && ! ask_yes_no "Continue?" "y"; then
+        log_error "Stopped. Fix DNS, then run this script again."
+        exit 1
+    fi
+}
+
+# Pre-checks before anything is written or started.
+pre_launch_checks() {
+    log_step "Checking ports and DNS"
+    if [[ "${ENABLE_HTTPS}" == "true" ]]; then
+        require_free_ports 80 443
+        check_domain_dns
     else
-        log_warn "Caddy may not have started correctly. Check with:"
-        log_info "  sudo systemctl status caddy"
-        log_info "  sudo journalctl -u caddy --no-pager -n 20"
+        require_free_ports "${HTTP_PORT}"
     fi
 }
 
@@ -740,17 +725,18 @@ configure_env() {
     local site_title
     site_title=$(ask "Site title" "${OMEKA_TITLE:-Omeka S}")
 
-    # Bind address + port. With Caddy, nginx binds to localhost only and Caddy
-    # handles 80/443; without it, nginx must bind 0.0.0.0 to be reachable.
-    local nginx_bind nginx_port
-    if $ENABLE_CADDY; then
-        nginx_bind="127.0.0.1"
-        nginx_port="8080"
-        log_info "Nginx will listen on 127.0.0.1:8080 (Caddy handles ports 80/443)"
-    else
-        nginx_bind="0.0.0.0"
-        nginx_port=$(ask "HTTP port for Omeka S" "${OMEKA_HTTP_PORT:-80}")
+    # HTTP port. With HTTPS, the bundled Caddy owns ports 80/443 and nginx is
+    # not published on the host at all.
+    if [[ "${ENABLE_HTTPS}" != "true" ]]; then
+        HTTP_PORT=$(ask "HTTP port for Omeka S" "${OMEKA_HTTP_PORT:-80}")
+        if [[ ! "${HTTP_PORT}" =~ ^[0-9]+$ ]] || (( HTTP_PORT < 1 || HTTP_PORT > 65535 )); then
+            log_error "'${HTTP_PORT}' is not a valid port number."
+            exit 1
+        fi
     fi
+
+    # Checked before .env exists: a re-run with .env present keeps it as is.
+    pre_launch_checks
 
     local secret_key
     secret_key=$(generate_secret_key)
@@ -782,26 +768,39 @@ OMEKA_ADMIN_PASSWORD="${ADMIN_PASSWORD}"
 ${ADMIN_BLOCK_END}
 
 OMEKA_TITLE="${site_title}"
-
-# Where nginx listens on the host.
-# With Caddy: localhost only (Caddy proxies 80/443 -> 127.0.0.1:8080).
-# Without Caddy: 0.0.0.0 so the site is reachable from outside.
-NGINX_BIND=${nginx_bind}
-NGINX_PORT=${nginx_port}
 EOF
 
-    if $ENABLE_CADDY; then
+    if [[ "${ENABLE_HTTPS}" == "true" ]]; then
+        # nginx keeps the template's default NGINX_TRUSTED_PROXY_CIDR, which
+        # covers the Docker bridge Caddy connects from.
         cat >> "${env_file}" << EOF
 
-# Public hostname (used in nginx server_name)
+# HTTPS: the template's bundled Caddy (compose.tls.yml) listens on ports 80
+# and 443 and obtains and renews the certificate for SERVER_NAME by itself.
+# Its certificates live in the caddy_data Docker volume: keep that volume.
+# See docs/PRODUCTION.md, "Bundled HTTPS (Caddy)", in this directory.
+COMPOSE_FILE=docker-compose.yml:compose.tls.yml
 SERVER_NAME=${DOMAIN_NAME}
 EOF
+        if [[ ! "${ADMIN_EMAIL,,}" =~ @example\.(com|org|net)$ ]]; then
+            echo "ACME_EMAIL=${ADMIN_EMAIL}" >> "${env_file}"
+        fi
+        if [[ -n "${ACME_CA:-}" ]]; then
+            echo "ACME_CA=${ACME_CA}" >> "${env_file}"
+        fi
+        if [[ -n "${CADDY_TLS:-}" ]]; then
+            echo "CADDY_TLS=${CADDY_TLS}" >> "${env_file}"
+        fi
     else
         # With no proxy in front, nginx must not believe client-supplied
         # X-Forwarded-For / X-Forwarded-Proto: that would let a client dodge the
-        # admin-login rate limit and pose as HTTPS. (The Caddy branch keeps the
-        # default range, which covers the Docker gateway Caddy arrives through.)
-        cat >> "${env_file}" << 'EOF'
+        # admin-login rate limit and pose as HTTPS.
+        cat >> "${env_file}" << EOF
+
+# Where nginx listens on the host: all interfaces, so the site is reachable
+# from outside.
+NGINX_BIND=0.0.0.0
+NGINX_PORT=${HTTP_PORT}
 
 # Direct HTTP, no reverse proxy: trust no peer's forwarded headers.
 # 192.0.2.1 is a documentation-only address, not a proxy to configure.
@@ -851,30 +850,29 @@ finish_first_install() {
 # ── Firewall ─────────────────────────────────────────────────────────────────
 
 configure_firewall() {
-    # Determine which ports to open
-    local ports=()
-    if $ENABLE_CADDY; then
-        ports=(80 443)
+    # Determine which ports to open (port/protocol). 443/udp carries HTTP/3;
+    # browsers fall back to TCP without it.
+    local ports=() p
+    if [[ "${ENABLE_HTTPS}" == "true" ]]; then
+        ports=(80/tcp 443/tcp 443/udp)
     else
-        local port
-        port=$(grep -oP '^NGINX_PORT=\K.*' "${PROJECT_DIR}/.env" 2>/dev/null || echo "80")
-        ports=("${port}")
+        ports=("${HTTP_PORT}/tcp")
     fi
 
     # Only suggest firewall changes if a firewall is active
     if command -v ufw &>/dev/null && $SUDO ufw status 2>/dev/null | grep -q "Status: active"; then
         log_step "Firewall detected (ufw)"
         for p in "${ports[@]}"; do
-            if ask_yes_no "Open port ${p}/tcp in ufw?" "y"; then
-                $SUDO ufw allow "${p}/tcp" comment "Omeka S" >/dev/null
+            if ask_yes_no "Open port ${p} in ufw?" "y"; then
+                $SUDO ufw allow "${p}" comment "Omeka S" >/dev/null
                 log_ok "Port ${p} opened"
             fi
         done
     elif command -v firewall-cmd &>/dev/null && $SUDO firewall-cmd --state 2>/dev/null | grep -q "running"; then
         log_step "Firewall detected (firewalld)"
         for p in "${ports[@]}"; do
-            if ask_yes_no "Open port ${p}/tcp in firewalld?" "y"; then
-                $SUDO firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null
+            if ask_yes_no "Open port ${p} in firewalld?" "y"; then
+                $SUDO firewall-cmd --permanent --add-port="${p}" >/dev/null
                 log_ok "Port ${p} opened"
             fi
         done
@@ -903,12 +901,6 @@ launch() {
     start_and_wait
     if [[ "${ENV_WRITTEN}" == "true" ]]; then
         finish_first_install
-    fi
-
-    # Start Caddy after Docker services are up
-    if $ENABLE_CADDY; then
-        configure_caddy
-        start_caddy
     fi
 }
 
@@ -963,14 +955,12 @@ print_summary() {
     ip=$(get_server_ip)
 
     local url
-    if $ENABLE_CADDY; then
+    if [[ "${ENABLE_HTTPS}" == "true" ]]; then
         url="https://${DOMAIN_NAME}"
     else
-        local port
-        port=$(grep -oP '^NGINX_PORT=\K.*' "${PROJECT_DIR}/.env" 2>/dev/null || echo "80")
         url="http://${ip}"
-        if [[ "${port}" != "80" ]]; then
-            url="http://${ip}:${port}"
+        if [[ "${HTTP_PORT}" != "80" ]]; then
+            url="http://${ip}:${HTTP_PORT}"
         fi
     fi
 
@@ -998,15 +988,19 @@ DONE
         echo ""
     fi
 
-    if $ENABLE_CADDY; then
-        echo -e "  ${BOLD}HTTPS:${NC}  Managed by Caddy (auto Let's Encrypt)"
-        echo -e "  ${BOLD}Domain:${NC} ${DOMAIN_NAME}"
-        echo ""
-        echo -e "  ${BOLD}Caddy commands:${NC}"
-        echo -e "    sudo systemctl status caddy     ${CYAN}# Check Caddy status${NC}"
-        echo -e "    sudo journalctl -u caddy -f      ${CYAN}# Caddy logs${NC}"
-        echo -e "    sudo nano /etc/caddy/Caddyfile   ${CYAN}# Edit Caddy config${NC}"
-        echo -e "    sudo systemctl reload caddy      ${CYAN}# Reload after editing${NC}"
+    if [[ "${ENABLE_HTTPS}" == "true" ]]; then
+        if [[ "${CADDY_TLS:-}" == "internal" ]]; then
+            echo -e "  ${BOLD}HTTPS:${NC}  bundled Caddy container, certificate from Caddy's own CA"
+            echo -e "          (browsers warn until its root certificate is trusted)"
+        else
+            echo -e "  ${BOLD}HTTPS:${NC}  bundled Caddy container, automatic Let's Encrypt certificate"
+            echo -e "          The first certificate can take a minute; until then the browser"
+            echo -e "          may show a security error. Watch it arrive with"
+            echo -e "          ${COMPOSE_CMD} logs -f caddy   ${CYAN}# look for \"certificate obtained\"${NC}"
+        fi
+        echo -e "          Keep the ${BOLD}caddy_data${NC} Docker volume: it holds the certificate."
+        echo -e "          Deleting it forces new certificates, and Let's Encrypt allows only"
+        echo -e "          5 identical ones per week."
         echo ""
     fi
 
@@ -1015,6 +1009,9 @@ DONE
     echo -e "  ${BOLD}Docker commands:${NC}"
     echo -e "    cd ${PROJECT_DIR}"
     echo -e "    ${COMPOSE_CMD} logs -f php   ${CYAN}# Application logs${NC}"
+    if [[ "${ENABLE_HTTPS}" == "true" ]]; then
+        echo -e "    ${COMPOSE_CMD} logs -f caddy ${CYAN}# HTTPS / certificate logs${NC}"
+    fi
     echo -e "    ${COMPOSE_CMD} ps            ${CYAN}# Check service status${NC}"
     echo -e "    ${COMPOSE_CMD} down          ${CYAN}# Stop all services${NC}"
     echo -e "    ${COMPOSE_CMD} up -d         ${CYAN}# Start all services${NC}"
@@ -1043,9 +1040,6 @@ main() {
     install_docker
     clone_repo
     ask_https
-    if $ENABLE_CADDY; then
-        install_caddy
-    fi
     configure_env
     launch
     print_summary
