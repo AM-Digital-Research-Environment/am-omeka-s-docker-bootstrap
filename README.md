@@ -105,7 +105,7 @@ Earlier versions installed Caddy on the host (`/etc/caddy/Caddyfile`) in front o
 
 ## Running it again
 
-Running the script again on an installed site (a directory with a `.env`) is safe. It keeps `.env` unchanged, regenerates nothing, asks nothing beyond the installation directory, starts the site if needed, waits until it is healthy and prints the address. `--domain`, `--port`, `--ref` and `--edge` have no effect then: to change a setting, edit `.env` and run `docker compose up -d` in the installation directory.
+Running the script again on an installed site (a directory with a `.env`) is safe. It keeps `.env` unchanged, regenerates nothing, asks nothing beyond the installation directory, starts the site if needed, waits until it is healthy and prints the address. `--domain`, `--port`, `--ref` and `--edge` have no effect then (the script says so): to change a setting, edit `.env` and run `docker compose up -d` in the installation directory.
 
 ## If something goes wrong
 
@@ -145,18 +145,18 @@ docker compose up -d                  # applies changes to the other services
 
 ## Requirements
 
-- Ubuntu, Debian, Fedora, Rocky Linux or Alma Linux (others try Docker's convenience install script).
+- Ubuntu, Debian, Fedora, Rocky Linux or Alma Linux. Linux Mint and Pop!_OS use Ubuntu's Docker packages; they and Alma are not part of the automated tests. Other distributions try Docker's convenience install script.
 - Root or `sudo` access.
 - Recommended: 4 GB of memory and 10 GB of free disk. A 2 GB server installs but can run out of memory under load or during a module upgrade.
 - For HTTPS: see [HTTPS](#https).
 
 ## Continuous testing
 
-The [workflows](.github/workflows/) test the installer:
+The [workflows](.github/workflows/) test the installer on every pull request and once a week, so a new template release that breaks fresh installs shows up here first:
 
 - **Lint**: ShellCheck and the unit tests in `tests/`.
 - **HTTP install**: a full install on a fresh runner against the latest template release, with a real admin login, then a second run on the installed site.
-- **HTTPS install**: the same with the bundled Caddy, using Caddy's internal certificate authority.
+- **HTTPS install**: a full install with the bundled Caddy, using Caddy's internal certificate authority; checks the redirect to HTTPS, HSTS and the `Secure` login cookie.
 - **Docker installation**: the Docker setup on Debian, Ubuntu, Fedora and Rocky containers.
 
 ## Security
