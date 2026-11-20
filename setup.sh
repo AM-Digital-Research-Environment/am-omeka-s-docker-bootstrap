@@ -388,17 +388,28 @@ install_docker_debian() {
     $SUDO apt-get update -qq
     $SUDO apt-get install -y -qq ca-certificates curl gnupg >/dev/null
 
+    # Docker publishes packages for Debian and Ubuntu only. Linux Mint and
+    # Pop!_OS are Ubuntu derivatives: they use Ubuntu's repository, under the
+    # Ubuntu release they are built on (UBUNTU_CODENAME), not their own name.
+    local repo_distro codename
+    case "${DISTRO_ID}" in
+        linuxmint|pop) repo_distro="ubuntu" ;;
+        *)             repo_distro="${DISTRO_ID}" ;;
+    esac
+    codename=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}")
+    if [[ -z "${codename}" ]]; then
+        log_error "Cannot tell which ${repo_distro} release this is (no VERSION_CODENAME in /etc/os-release)."
+        exit 1
+    fi
+
     # Docker's official GPG key
     $SUDO install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL "https://download.docker.com/linux/${DISTRO_ID}/gpg" | \
+    curl -fsSL "https://download.docker.com/linux/${repo_distro}/gpg" | \
         $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     $SUDO chmod a+r /etc/apt/keyrings/docker.gpg
 
     # Repository
-    echo \
-        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-        https://download.docker.com/linux/${DISTRO_ID} \
-        $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${repo_distro} ${codename} stable" | \
         $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
 
     # Install
