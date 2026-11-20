@@ -25,7 +25,7 @@
 #   -h, --help                     Show this help
 #
 # Additional environment variables:
-#   MYSQL_PASSWORD          MySQL password (default: auto-generated)
+#   MYSQL_PASSWORD          MySQL password (default: auto-generated, never asked)
 #   OMEKA_ADMIN_EMAIL       Admin account email (default: admin@example.com)
 #   OMEKA_ADMIN_PASSWORD    Admin account password (default: auto-generated)
 #   OMEKA_TITLE             Site title (default: "Omeka S")
@@ -777,6 +777,83 @@ generate_secret_key() {
     head -c 32 /dev/urandom | base64 | tr -d '\n'
 }
 
+# Docker Compose reads a single-quoted .env value literally, with two
+# exceptions that differ between Compose versions: a backslash before a
+# single quote, and so a single quote itself or a trailing backslash (which
+# would escape the closing quote), cannot be written reliably. Line breaks
+# would end the value. Refuse such values rather than write a broken .env.
+env_quote_ok() {
+    local value="$1"
+    [[ "${value}" != *"'"* && "${value}" != *$'\n'* && "${value}" != *$'\r'* && "${value}" != *\\ ]]
+}
+
+env_quote_check() {
+    local name="$1" value="$2"
+    if ! env_quote_ok "${value}"; then
+        log_error "${name} cannot contain a single quote ('), a line break, or end with a backslash."
+        log_info "Choose another value (or leave ${name} unset to have one generated)."
+        exit 1
+    fi
+}
+
+# Makes a site title safe for a single-quoted .env value, saying what changed:
+# a straight apostrophe becomes a typographic one (’), line breaks become
+# spaces, trailing backslashes go. The title can be edited in the Omeka admin
+# afterwards anyway.
+sanitize_title() {
+    local title="$1" original="$1"
+    title="${title//\'/’}"
+    title="${title//$'\r'/ }"
+    title="${title//$'\n'/ }"
+    while [[ "${title}" == *\\ || "${title}" == *[[:space:]] ]]; do
+        title="${title%?}"
+    done
+    if [[ "${title}" != "${original}" ]]; then
+        log_info "Site title adjusted for .env: ${title}"
+    fi
+    if [[ -z "${title//[[:space:]]/}" ]]; then
+        title="Omeka S"
+    fi
+    printf '%s\n' "${title}"
+}
+
+# A plausible address: something@domain.tld, nothing that would break .env.
+valid_email() {
+    [[ "$1" =~ ^[^[:space:]\'\"@]+@[^[:space:]\'\"@]+\.[^[:space:]\'\"@]+$ ]]
+}
+
+is_placeholder_email() {
+    [[ "${1,,}" =~ @example\.(com|org|net)$ ]]
+}
+
+# Sets ADMIN_EMAIL. Interactively a real address is required: password-reset
+# mails (and, with HTTPS, Let's Encrypt's expiry warnings) go there.
+ask_admin_email() {
+    if [[ "${NONINTERACTIVE}" == "true" ]]; then
+        ADMIN_EMAIL="${OMEKA_ADMIN_EMAIL:-admin@example.com}"
+        if ! valid_email "${ADMIN_EMAIL}"; then
+            log_error "OMEKA_ADMIN_EMAIL '${ADMIN_EMAIL}' is not a valid email address."
+            exit 1
+        fi
+        log_info "Admin account email: ${ADMIN_EMAIL}"
+        if is_placeholder_email "${ADMIN_EMAIL}"; then
+            log_warn "${ADMIN_EMAIL} is a placeholder: password-reset mails will go nowhere."
+            log_warn "Set OMEKA_ADMIN_EMAIL, or change the address in the Omeka admin after logging in."
+        fi
+        return
+    fi
+    while :; do
+        ADMIN_EMAIL=$(ask "Admin account email (for password resets)" "${OMEKA_ADMIN_EMAIL:-}")
+        if ! valid_email "${ADMIN_EMAIL}"; then
+            log_warn "Please enter a valid email address, such as name@university.edu."
+        elif is_placeholder_email "${ADMIN_EMAIL}"; then
+            log_warn "example.com addresses receive no mail; please enter a real address."
+        else
+            break
+        fi
+    done
+}
+
 configure_env() {
     log_step "Configuring environment"
 
@@ -786,33 +863,34 @@ configure_env() {
     echo -e "  ${BOLD}Let's configure your Omeka S instance:${NC}"
     echo ""
 
-    # MySQL password
+    # MySQL password: never asked. Nobody types it in anywhere, and a random
+    # one is safer than anything chosen at a prompt.
     local mysql_password
     if [[ -n "${MYSQL_PASSWORD:-}" ]]; then
         mysql_password="${MYSQL_PASSWORD}"
         log_ok "Using MySQL password from environment"
     else
-        local auto_password
-        auto_password=$(generate_password)
-        log_info "MySQL password — press Enter for an auto-generated secure password, or type your own."
-        mysql_password=$(ask "MySQL password" "${auto_password}")
+        mysql_password=$(generate_password)
+        log_ok "MySQL password generated (stored in .env)"
     fi
+    env_quote_check "MYSQL_PASSWORD" "${mysql_password}"
 
-    # Admin account: creating it here skips Omeka's web install wizard AND
-    # avoids the default admin@example.com/admin credentials the installer
-    # would otherwise create.
-    ADMIN_EMAIL=$(ask "Admin account email" "${OMEKA_ADMIN_EMAIL:-admin@example.com}")
+    # Admin account: creating it here avoids the placeholder account the
+    # template's installer would otherwise create.
+    ask_admin_email
     if [[ -n "${OMEKA_ADMIN_PASSWORD:-}" ]]; then
         ADMIN_PASSWORD="${OMEKA_ADMIN_PASSWORD}"
         log_ok "Using admin password from environment"
     else
         ADMIN_PASSWORD=$(generate_password)
-        log_info "Admin password auto-generated (shown in the summary at the end)."
+        log_info "Admin password generated (shown once, in the summary at the end)."
     fi
+    env_quote_check "OMEKA_ADMIN_PASSWORD" "${ADMIN_PASSWORD}"
 
     # Site title
     local site_title
     site_title=$(ask "Site title" "${OMEKA_TITLE:-Omeka S}")
+    site_title=$(sanitize_title "${site_title}")
 
     # HTTP port. With HTTPS, the bundled Caddy owns ports 80/443 and nginx is
     # not published on the host at all.
@@ -839,24 +917,27 @@ configure_env() {
 # Omeka S Docker — Generated by setup.sh on $(date -Iseconds)
 # Template ref: ${DEPLOYED_REF:-unknown}
 
+# Values in single quotes are taken literally by Docker Compose ($, ", #
+# and spaces need no escaping), but cannot contain a single quote.
+
 # MySQL password
-MYSQL_PASSWORD="${mysql_password}"
+MYSQL_PASSWORD='${mysql_password}'
 
 # Encryption key for secrets Omeka stores (module API keys and similar).
 # NEVER change it after the first start: anything already encrypted with it
 # becomes unreadable. Back it up together with the rest of this file.
-OMEKA_SECRET_KEY=${secret_key}
+OMEKA_SECRET_KEY='${secret_key}'
 
 ${ADMIN_BLOCK_START}
 # Read only by the very first start, which creates this account. setup.sh
 # deletes this block once that install has finished; changing these values
 # later would not change the real account (use the Omeka admin for that).
-OMEKA_ADMIN_EMAIL="${ADMIN_EMAIL}"
-OMEKA_ADMIN_USERNAME="admin"
-OMEKA_ADMIN_PASSWORD="${ADMIN_PASSWORD}"
+OMEKA_ADMIN_EMAIL='${ADMIN_EMAIL}'
+OMEKA_ADMIN_USERNAME='admin'
+OMEKA_ADMIN_PASSWORD='${ADMIN_PASSWORD}'
 ${ADMIN_BLOCK_END}
 
-OMEKA_TITLE="${site_title}"
+OMEKA_TITLE='${site_title}'
 EOF
 
     if [[ "${ENABLE_HTTPS}" == "true" ]]; then
@@ -871,8 +952,8 @@ EOF
 COMPOSE_FILE=docker-compose.yml:compose.tls.yml
 SERVER_NAME=${DOMAIN_NAME}
 EOF
-        if [[ ! "${ADMIN_EMAIL,,}" =~ @example\.(com|org|net)$ ]]; then
-            echo "ACME_EMAIL=${ADMIN_EMAIL}" >> "${env_file}"
+        if ! is_placeholder_email "${ADMIN_EMAIL}"; then
+            echo "ACME_EMAIL='${ADMIN_EMAIL}'" >> "${env_file}"
         fi
         if [[ -n "${ACME_CA:-}" ]]; then
             echo "ACME_CA=${ACME_CA}" >> "${env_file}"
