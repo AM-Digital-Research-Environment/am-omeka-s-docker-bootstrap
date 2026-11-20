@@ -125,6 +125,11 @@ DEPLOYED_REF=""
 ADMIN_EMAIL=""
 ADMIN_PASSWORD=""
 WAIT_TIMEOUT=600   # seconds `docker compose up --wait` may take
+ENV_WRITTEN=false          # true once this run wrote a fresh .env
+ADMIN_CREDS_REMOVED=false  # true once OMEKA_ADMIN_* left .env again
+# Marker lines around the first-install admin block in .env.
+ADMIN_BLOCK_START="# >>> First admin account (removed by setup.sh after the first install)"
+ADMIN_BLOCK_END="# <<< First admin account"
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -752,11 +757,15 @@ MYSQL_PASSWORD="${mysql_password}"
 # becomes unreadable. Back it up together with the rest of this file.
 OMEKA_SECRET_KEY=${secret_key}
 
-# Admin account (created automatically on first run; log in and change
-# the password afterwards if this file was ever exposed)
+${ADMIN_BLOCK_START}
+# Read only by the very first start, which creates this account. setup.sh
+# deletes this block once that install has finished; changing these values
+# later would not change the real account (use the Omeka admin for that).
 OMEKA_ADMIN_EMAIL="${ADMIN_EMAIL}"
 OMEKA_ADMIN_USERNAME="admin"
 OMEKA_ADMIN_PASSWORD="${ADMIN_PASSWORD}"
+${ADMIN_BLOCK_END}
+
 OMEKA_TITLE="${site_title}"
 
 # Where nginx listens on the host.
@@ -788,7 +797,40 @@ EOF
     fi
 
     chmod 600 "${env_file}"
+    ENV_WRITTEN=true
     log_ok "Configuration saved to .env"
+}
+
+# The template reads OMEKA_ADMIN_* only on the first install, and the php
+# container warns on every later start while OMEKA_ADMIN_PASSWORD is still
+# set. Once that install is done (php is healthy only after it), delete the
+# block from .env: the credentials are then shown once, in the summary.
+remove_admin_credentials() {
+    local env_file="${PROJECT_DIR}/.env"
+    local tmp_file="${env_file}.tmp.$$"
+    (
+        umask 077
+        awk -v start="${ADMIN_BLOCK_START}" -v end="${ADMIN_BLOCK_END}" '
+            $0 == start { skip = 1; next }
+            skip && $0 == end { skip = 0; drop_blank = 1; next }
+            skip { next }
+            /^OMEKA_ADMIN_(EMAIL|USERNAME|PASSWORD)=/ { next }
+            drop_blank && $0 == "" { drop_blank = 0; next }
+            { drop_blank = 0; print }
+        ' "${env_file}" > "${tmp_file}"
+    )
+    chmod 600 "${tmp_file}"
+    mv -f "${tmp_file}" "${env_file}"
+    ADMIN_CREDS_REMOVED=true
+}
+
+# After a fresh install: drop the admin credentials from .env and recreate
+# php so they leave its environment too.
+finish_first_install() {
+    log_step "Removing the admin password from .env"
+    remove_admin_credentials
+    log_ok "OMEKA_ADMIN_* removed from .env (only needed by the first install)"
+    start_and_wait
 }
 
 # ── Firewall ─────────────────────────────────────────────────────────────────
@@ -844,6 +886,9 @@ launch() {
     fi
 
     start_and_wait
+    if [[ "${ENV_WRITTEN}" == "true" ]]; then
+        finish_first_install
+    fi
 
     # Start Caddy after Docker services are up
     if $ENABLE_CADDY; then
@@ -876,6 +921,14 @@ start_and_wait() {
     log_info "simply need more time: wait a few minutes, then check again with"
     log_info "  cd ${PROJECT_DIR} && ${COMPOSE_CMD} ps"
     log_info "Too little memory (under 4 GB) is the most common cause of a failed start."
+    if [[ "${ADMIN_CREDS_REMOVED}" == "true" ]]; then
+        # Omeka itself is installed; the credentials are no longer in .env,
+        # so this is the last chance to see them.
+        echo >&2 ""
+        log_warn "Omeka S was installed. Store this admin login now, it is not saved anywhere:"
+        log_info "  Email:    ${ADMIN_EMAIL}"
+        log_info "  Password: ${ADMIN_PASSWORD}"
+    fi
     exit 2
 }
 
@@ -921,10 +974,12 @@ DONE
     echo ""
 
     if [[ -n "${ADMIN_PASSWORD}" ]]; then
-        echo -e "  ${BOLD}Admin login${NC} (also saved in ${PROJECT_DIR}/.env):"
+        echo -e "  ${BOLD}Admin login${NC} ${YELLOW}(shown only this once, not saved anywhere: store it now,${NC}"
+        echo -e "  ${YELLOW}e.g. in a password manager)${NC}"
         echo -e "    Email:    ${BOLD}${ADMIN_EMAIL}${NC}"
         echo -e "    Password: ${BOLD}${ADMIN_PASSWORD}${NC}"
-        echo -e "    Log in at ${CYAN}${url}/admin${NC} and store these credentials safely."
+        echo -e "    Log in at ${CYAN}${url}/login${NC}. Change the password later under your"
+        echo -e "    user's Password tab in the Omeka admin."
         echo ""
     fi
 
@@ -944,7 +999,7 @@ DONE
     echo ""
     echo -e "  ${BOLD}Docker commands:${NC}"
     echo -e "    cd ${PROJECT_DIR}"
-    echo -e "    ${COMPOSE_CMD} logs -f php   ${CYAN}# Watch installation logs${NC}"
+    echo -e "    ${COMPOSE_CMD} logs -f php   ${CYAN}# Application logs${NC}"
     echo -e "    ${COMPOSE_CMD} ps            ${CYAN}# Check service status${NC}"
     echo -e "    ${COMPOSE_CMD} down          ${CYAN}# Stop all services${NC}"
     echo -e "    ${COMPOSE_CMD} up -d         ${CYAN}# Start all services${NC}"
@@ -952,10 +1007,6 @@ DONE
     echo -e "  ${BOLD}Module management:${NC}"
     echo -e "    bash scripts/install-module.sh list       ${CYAN}# List available modules${NC}"
     echo -e "    bash scripts/install-module.sh CSVImport  ${CYAN}# Install a module${NC}"
-    echo ""
-    echo -e "  ${BOLD}First-time setup:${NC}"
-    echo -e "    Omeka S auto-installs on first start. This can take a few minutes."
-    echo -e "    Watch progress with: ${COMPOSE_CMD} logs -f php"
     echo ""
     echo -e "  ${BOLD}Keeping it up to date${NC} (run from ${PROJECT_DIR}):"
     echo -e "    bash scripts/update-omeka.sh --dry-run  ${CYAN}# New Omeka S version (backs up first)${NC}"
